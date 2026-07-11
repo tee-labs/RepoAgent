@@ -122,6 +122,14 @@ def handle_setting_error(e: ValidationError):
     show_default=True,
 )
 @click.option(
+    "--file-extensions",
+    "-fe",
+    default="py",
+    show_default=True,
+    help="Comma-separated list of source file extensions to process (without dots). "
+    "Examples: 'py' for Python, 'java' for Java, 'py,java' for both.",
+)
+@click.option(
     "--log-level",
     "-ll",
     default="INFO",
@@ -150,6 +158,7 @@ def run(
     max_thread_count,
     log_level,
     print_hierarchy,
+    file_extensions,
 ):
     """Run the program with the specified parameters."""
     try:
@@ -166,6 +175,9 @@ def run(
             request_timeout=request_timeout,
             openai_base_url=base_url,
             max_thread_count=max_thread_count,
+            file_extensions=[
+                ext.strip() for ext in file_extensions.split(",") if ext.strip()
+            ],
         )
         set_logger_level_from_config(log_level=log_level)
     except ValidationError as e:

@@ -23,20 +23,29 @@ class ChangeDetector:
         repo_path (str): The path to the repository.
 
         Returns:
-        None
+            None
         """
         self.repo_path = repo_path
         self.repo = git.Repo(repo_path)
+        # 从 settings 获取要检测的源文件扩展名
+        from repo_agent.settings import SettingsManager
+
+        self.file_extensions = SettingsManager.get_setting().project.file_extensions
+
+    def _matches_source_extension(self, file_path: str) -> bool:
+        """检查文件路径是否匹配已配置的源代码扩展名。"""
+        return any(file_path.endswith("." + ext) for ext in self.file_extensions)
 
     def get_staged_pys(self):
         """
-        Get added python files in the repository that have been staged.
+        Get added source files in the repository that have been staged.
 
-        This function only tracks the changes of Python files in Git that have been staged,
+        This function only tracks the changes of source files (matching the
+        configured extensions) in Git that have been staged,
         i.e., the files that have been added using `git add`.
 
         Returns:
-            dict: A dictionary of changed Python files, where the keys are the file paths and the values are booleans indicating whether the file is newly created or not.
+            dict: A dictionary of changed source files, where the keys are the file paths and the values are booleans indicating whether the file is newly created or not.
 
         """
         repo = self.repo
@@ -48,7 +57,7 @@ class ChangeDetector:
         diffs = repo.index.diff("HEAD", R=True)
 
         for diff in diffs:
-            if diff.change_type in ["A", "M"] and diff.a_path.endswith(".py"):
+            if diff.change_type in ["A", "M"] and self._matches_source_extension(diff.a_path):
                 is_new_file = diff.change_type == "A"
                 staged_files[diff.a_path] = is_new_file
 

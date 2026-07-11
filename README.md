@@ -34,7 +34,7 @@
 
 ## 👾 Background
 
-In the realm of computer programming, the significance of comprehensive project documentation, including detailed explanations for each Python file, cannot be overstated. Such documentation serves as the cornerstone for understanding, maintaining, and enhancing the codebase. It provides essential context and rationale for the code, making it easier for current and future developers to comprehend the purpose, functionality, and structure of the software. It not only facilitates current and future developers in grasping the project's purpose and structure but also ensures that the project remains accessible and modifiable over time, significantly easing the learning curve for new team members.
+In the realm of computer programming, the significance of comprehensive project documentation, including detailed explanations for each source file, cannot be overstated. Such documentation serves as the cornerstone for understanding, maintaining, and enhancing the codebase. It provides essential context and rationale for the code, making it easier for current and future developers to comprehend the purpose, functionality, and structure of the software. It not only facilitates current and future developers in grasping the project's purpose and structure but also ensures that the project remains accessible and modifiable over time, significantly easing the learning curve for new team members.
 
 Traditionally, creating and maintaining software documentation demanded significant human effort and expertise, a challenge for small teams without dedicated personnel. The introduction of Large Language Models (LLMs) like GPT has transformed this, enabling AI to handle much of the documentation process. This shift allows human developers to focus on verification and fine-tuning, greatly reducing the manual burden of documentation.
 
@@ -42,8 +42,9 @@ Traditionally, creating and maintaining software documentation demanded signific
 
 ## ✨ Features
 
+- **🌐 Multi-language support powered by [codebase-memory-mcp](https://github.com/DeusData/codebase-memory-mcp) — Python, Java, Go, TypeScript, C/C++, and 150+ languages via tree-sitter.**
 - **🤖 Automatically detects changes in Git repositories, tracking additions, deletions, and modifications of files.**
-- **📝 Independently analyzes the code structure through AST, generating documents for individual objects.**
+- **📝 Independently analyzes the code structure, generating documents for individual objects (functions, classes, methods).**
 - **🔍 Accurate identification of inter-object bidirectional invocation relationships, enriching the global perspective of document content.**
 - **📚 Seamlessly replaces Markdown content based on changes, maintaining consistency in documentation.**
 - **🕙 Executes multi-threaded concurrent operations, enhancing the efficiency of document generation.**
@@ -112,6 +113,8 @@ set OPENAI_API_KEY=YOUR_API_KEY # on Windows
 $Env:OPENAI_API_KEY = "YOUR_API_KEY" # on Windows (PowerShell)
 ```
 
+RepoAgent uses [codebase-memory-mcp](https://github.com/DeusData/codebase-memory-mcp) as its code intelligence backend for AST parsing and cross-reference analysis. The `codebase-memory-mcp` binary is automatically downloaded on first run (via the `codebase-memory-mcp` PyPI package) — no manual setup required.
+
 ## Run RepoAgent
 
 Enter the root directory of RepoAgent and try the following command in the terminal:
@@ -120,9 +123,14 @@ repoagent run #this command will generate doc, or update docs(pre-commit-hook wi
 repoagent run --print-hierarchy # Print how repo-agent parse the target repo
 ```
 
+**Multi-language example** — generate docs for a Java repository:
+```sh
+repoagent run --target-repo-path /path/to/java/repo --file-extensions java
+```
+
 The run command supports the following optional flags (if set, will override config defaults):
 
-- `-m`, `--model` TEXT: Specifies the model to use for completion. Default: `gpt-3.5-turbo`
+- `-m`, `--model` TEXT: Specifies the model to use for completion. Default: `gpt-4o-mini`
 - `-t`, `--temperature` FLOAT: Sets the generation temperature for the model. Lower values make the model more deterministic. Default: `0.2`
 - `-r`, `--request-timeout` INTEGER: Defines the timeout in seconds for the API request. Default: `60`
 - `-b`, `--base-url` TEXT: The base URL for the API calls. Default: `https://api.openai.com/v1`
@@ -130,8 +138,9 @@ The run command supports the following optional flags (if set, will override con
 - `-hp`, `--hierarchy-path` TEXT: The name or path for the project hierarchy file, used to organize documentation structure. Default: `.project_doc_record`
 - `-mdp`, `--markdown-docs-path` TEXT: The folder path where Markdown documentation will be stored or generated. Default: `markdown_docs`
 - `-i`, `--ignore-list` TEXT: A list of files or directories to ignore during documentation generation, separated by commas.
-- `-l`, `--language` TEXT: The ISO 639 code or language name for the documentation. Default: `Chinese`
+- `-l`, `--language` TEXT: The ISO 639 code or language name for the documentation. Default: `English`
 - `-ll`, `--log-level` [DEBUG|INFO|WARNING|ERROR|CRITICAL]: Sets the logging level for the application. Default: `INFO`
+- `-fe`, `--file-extensions` TEXT: Comma-separated list of source file extensions to process (without dots). Examples: `py` for Python, `java` for Java, `py,java` for both. Default: `py`
 
 You can also try the following feature
 
@@ -169,8 +178,10 @@ repos:
       entry: repoagent
       language: system
       pass_filenames: false # prevent from passing filenames to the hook
-      # You can specify the file types that trigger the hook, but currently only python is supported.
+      # File types that trigger the hook (any language supported by codebase-memory-mcp)
       types: [python]
+      # For Java projects, use: types: [java]
+      # For multi-language projects, add multiple hook entries or use types: [file]
 ```
 
 For specific configuration methods of hooks, please refer to [pre-commit](https://pre-commit.com/#plugins).
@@ -210,7 +221,7 @@ repoagent chat-with-repo
 ## ✅ Future Work
 
 - [ ] Generate README.md automatically combining with the global documentation
-- [ ] **Multi-programming-language support** Support more programming languages like Java, C or C++, etc.
+- [x] **Multi-programming-language support** — Powered by [codebase-memory-mcp](https://github.com/DeusData/codebase-memory-mcp) (tree-sitter), now supporting Python, Java, Go, TypeScript, C/C++, and 150+ languages.
 - [x] Local model support like Llama, chatGLM, Qwen, GLM4, etc.
 
 ## 🥰 Featured Cases

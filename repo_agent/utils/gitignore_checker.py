@@ -3,16 +3,19 @@ import os
 
 
 class GitignoreChecker:
-    def __init__(self, directory: str, gitignore_path: str):
+    def __init__(self, directory: str, gitignore_path: str, file_extensions=None):
         """
         Initialize the GitignoreChecker with a specific directory and the path to a .gitignore file.
 
         Args:
             directory (str): The directory to be checked.
             gitignore_path (str): The path to the .gitignore file.
+            file_extensions (list[str], optional): Source file extensions to collect
+                (without dots, e.g. ["py", "java"]). Defaults to ["py"].
         """
         self.directory = directory
         self.gitignore_path = gitignore_path
+        self.file_extensions = file_extensions if file_extensions else ["py"]
         self.folder_patterns, self.file_patterns = self._load_gitignore_patterns()
 
     def _load_gitignore_patterns(self) -> tuple:
@@ -99,11 +102,12 @@ class GitignoreChecker:
     def check_files_and_folders(self) -> list:
         """
         Check all files and folders in the given directory against the split gitignore patterns.
-        Return a list of files that are not ignored and have the '.py' extension.
+        Return a list of source files that are not ignored and match the configured extensions.
         The returned file paths are relative to the self.directory.
 
         Returns:
-            list: A list of paths to files that are not ignored and have the '.py' extension.
+            list: A list of paths to files that are not ignored and match the
+                  configured file extensions.
         """
         not_ignored_files = []
         for root, dirs, files in os.walk(self.directory):
@@ -118,10 +122,17 @@ class GitignoreChecker:
                 relative_path = os.path.relpath(file_path, self.directory)
                 if not self._is_ignored(
                     file, self.file_patterns
-                ) and file_path.endswith(".py"):
+                ) and self._matches_extension(file):
                     not_ignored_files.append(relative_path)
 
         return not_ignored_files
+
+    def _matches_extension(self, filename: str) -> bool:
+        """Check if a filename ends with any of the configured extensions."""
+        for ext in self.file_extensions:
+            if filename.endswith("." + ext):
+                return True
+        return False
 
 
 # Example usage:

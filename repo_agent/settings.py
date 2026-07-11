@@ -31,6 +31,16 @@ class ProjectSettings(BaseSettings):
     language: str = "English"
     max_thread_count: PositiveInt = 4
     log_level: LogLevel = LogLevel.INFO
+    # codebase-memory-mcp 二进制路径
+    cbm_binary_path: str = "codebase-memory-mcp"
+    # CBM 索引模式: "full" / "moderate" / "fast"
+    cbm_index_mode: str = "full"
+    # 要处理的源代码文件扩展名列表（不含点号）。
+    # codebase-memory-mcp 支持 158 种语言；常见配置:
+    #   Python: ["py"]
+    #   Java:   ["java"]
+    #   多语言: ["py", "java", "ts", "go"]
+    file_extensions: list[str] = ["py"]
 
     @field_validator("language")
     @classmethod
@@ -98,7 +108,12 @@ class SettingsManager:
         temperature: float,
         request_timeout: int,
         openai_base_url: str,
+        cbm_binary_path: str = "codebase-memory-mcp",
+        cbm_index_mode: str = "full",
+        file_extensions: list[str] = None,
     ):
+        if file_extensions is None:
+            file_extensions = ["py"]
         project_settings = ProjectSettings(
             target_repo=target_repo,
             hierarchy_name=hierarchy_name,
@@ -107,6 +122,9 @@ class SettingsManager:
             language=language,
             max_thread_count=max_thread_count,
             log_level=LogLevel(log_level),
+            cbm_binary_path=cbm_binary_path,
+            cbm_index_mode=cbm_index_mode,
+            file_extensions=file_extensions,
         )
 
         chat_completion_settings = ChatCompletionSettings(

@@ -1,0 +1,596 @@
+"""codebase-memory-mcp 后端：通过 CLI subprocess 调用 CBM 二进制。
+
+调用方式::
+
+    codebase-memory-mcp cli <tool> --json --flag value ...
+
+CBM 会对仓库建索引（tree-sitter + SQLite 知识图谱），然后通过
+``search_graph`` / ``trace_path`` / ``get_code_snippet`` 等工具查询。
+所有查询结果映射为与 ``FileHandler.get_obj_code_info`` 相同的 ``code_info``
+字典格式，确保下游消费者无需修改。
+
+MCP CLI 响应信封格式::
+
+    {"content":[{"type":"text","text":"<内嵌 JSON>"}],
+     "structuredContent":{<实际工具结果>},
+     "isError":false}
+
+``_run_cli`` 会自动解包 ``structuredContent``，调用方直接拿到工具结果。
+"""
+
+from __future__ import annotations
+
+import json
+import re
+import subprocess
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+from repo_agent.code_intelligence.base import CodeIntelligenceBackend
+from repo_agent.log import logger
+from repo_agent.utils.meta_info_utils import _is_latest_version_file
+
+# CBM node label → RepoAgent code type
+_LABEL_TO_TYPE = {
+    "Function": "FunctionDef",
+    "Method": "FunctionDef",
+    "AsyncFunction": "FunctionDef",
+    "Class": "ClassDef",
+    "Struct": "ClassDef",
+    "Interface": "ClassDef",
+}
+
+# 合法的 search_graph label 过滤值（只关注可生成文档的代码对象）
+_STRUCTURE_LABELS = ["Function", "Method", "Class"]
+
+# 非项目内文件的标识符（内置库、第三方包等），需要过滤
+_NON_PROJECT_FILE_MARKERS = ("<python-builtins>", "<unknown>", "<builtin>")
+
+
+def _is_project_file(file_path: str) -> bool:
+    """判断 file_path 是否是项目内文件（非内置/第三方）。"""
+    if not file_path:
+        return False
+    return not file_path.startswith(_NON_PROJECT_FILE_MARKERS)
+
+
+def _parse_params_from_signature(signature: str) -> List[str]:
+    """从 CBM 的 signature 字段解析参数名列表。
+
+    CBM signature 格式如 ``(a, b)`` 或 ``(self, name, age=18)``。
+    """
+    if not signature:
+        return []
+    # 提取括号内的内容
+    match = re.match(r"\((.*)\)", signature.strip())
+    if not match:
+        return []
+    inner = match.group(1).strip()
+    if not inner:
+        return []
+    params = []
+    for part in inner.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        # 去掉默认值和类型注解: "name=value" → "name", "name: type" → "name"
+        param_name = re.split(r"[=:]", part)[0].strip()
+        # 去掉 *args/**kwargs 的星号
+        param_name = param_name.lstrip("*")
+        if param_name:
+            params.append(param_name)
+    return params
+
+
+class CodebaseMemoryBackend(CodeIntelligenceBackend):
+    """通过 CLI 调用 codebase-memory-mcp 的代码智能后端。"""
+
+    def __init__(self, binary_path: str = "codebase-memory-mcp"):
+        self.binary = binary_path
+        # 缓存: (file_path, obj_name, start_line) → qualified_name
+        # 在 get_file_structure / get_overall_structure 时填充，
+        # find_references 时查用，避免每次 trace_path 都先 search_graph。
+        self._qn_cache: Dict[Tuple[str, str, int], str] = {}
+        # qualified_name → (file_path, start_line, end_line) 缓存
+        # 用于 find_references 中补全 caller 的文件路径和行号
+        self._node_info_cache: Dict[str, Tuple[str, int, int]] = {}
+        # 标记是否已对当前仓库建过索引
+        self._indexed_repo: Optional[str] = None
+
+    # ── CLI 调用基础设施 ──────────────────────────────────────────
+
+    def _run_cli(self, tool: str, args: dict) -> Any:
+        """调用 ``codebase-memory-mcp cli <tool> --json``，返回解包后的结果。
+
+        自动解包 MCP 响应信封，返回 ``structuredContent``（或退回到
+        ``content[0].text`` 解析出的 JSON）。
+
+        Args:
+            tool: MCP 工具名（如 ``"search_graph"``）。
+            args: 工具参数字典。
+
+        Returns:
+            解包后的工具结果（通常是 dict）。
+
+        Raises:
+            RuntimeError: 如果二进制不存在、调用失败或返回错误。
+        """
+        cmd = [self.binary, "cli", tool, "--json"]
+
+        for key, value in args.items():
+            if value is None:
+                continue
+            if isinstance(value, bool):
+                if value:
+                    cmd.append(f"--{key}")
+            elif isinstance(value, list):
+                cmd.append(f"--{key}")
+                cmd.append(",".join(str(v) for v in value))
+            else:
+                cmd.append(f"--{key}")
+                cmd.append(str(value))
+
+        logger.debug(f"CBM CLI: {' '.join(cmd)}")
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=600,
+            )
+        except FileNotFoundError:
+            raise RuntimeError(
+                f"codebase-memory-mcp binary not found at '{self.binary}'. "
+                f"Install it via `pip install codebase-memory-mcp` or "
+                f"download from https://github.com/DeusData/codebase-memory-mcp/releases."
+            )
+        except subprocess.TimeoutExpired:
+            raise RuntimeError(
+                f"codebase-memory-mcp CLI timed out (600s) for tool '{tool}'."
+            )
+
+        if result.returncode != 0:
+            stderr = result.stderr.strip()
+            raise RuntimeError(
+                f"codebase-memory-mcp CLI failed (exit {result.returncode}) "
+                f"for tool '{tool}': {stderr}"
+            )
+
+        stdout = result.stdout.strip()
+        if not stdout:
+            raise RuntimeError(
+                f"codebase-memory-mcp CLI returned empty output for tool '{tool}'."
+            )
+
+        try:
+            envelope = json.loads(stdout)
+        except json.JSONDecodeError as e:
+            raise RuntimeError(
+                f"codebase-memory-mcp CLI returned invalid JSON for tool '{tool}': {e}\n"
+                f"Output: {stdout[:500]}"
+            )
+
+        # 解包 MCP 响应信封
+        if isinstance(envelope, dict):
+            # 检查是否是错误响应
+            if envelope.get("isError"):
+                content = envelope.get("content", [])
+                error_text = ""
+                if content and isinstance(content, list):
+                    error_text = content[0].get("text", "")
+                raise RuntimeError(
+                    f"codebase-memory-mcp tool '{tool}' returned error: {error_text}"
+                )
+
+            # 优先使用 structuredContent（已解析的 JSON）
+            structured = envelope.get("structuredContent")
+            if structured is not None:
+                return structured
+
+            # 退回到 content[0].text（需要二次解析）
+            content = envelope.get("content", [])
+            if content and isinstance(content, list):
+                text = content[0].get("text", "")
+                if text:
+                    try:
+                        return json.loads(text)
+                    except json.JSONDecodeError:
+                        return text
+
+        return envelope
+
+    # ── CodeIntelligenceBackend 实现 ─────────────────────────────
+
+    def index_repo(self, repo_path: Path, mode: str = "full") -> None:
+        """对目标仓库建立 CBM 索引。
+
+        先检查 ``index_status``，若索引已存在且覆盖完整则跳过。
+        """
+        repo_str = str(repo_path)
+        if self._indexed_repo == repo_str:
+            return
+
+        # 检查是否已有索引
+        try:
+            status = self._run_cli("index_status", {"project": repo_str})
+            if isinstance(status, dict) and not status.get("error"):
+                node_count = status.get("nodes", 0)
+                if node_count > 0:
+                    logger.info(
+                        f"CBM index already exists for {repo_str} "
+                        f"({node_count} nodes, {status.get('edges', 0)} edges)."
+                    )
+                    self._indexed_repo = repo_str
+                    return
+        except RuntimeError:
+            # index_status 失败说明尚未索引，继续建索引
+            logger.debug("CBM index_status failed, proceeding to index.")
+
+        logger.info(f"CBM: indexing repository {repo_str} (mode={mode})...")
+        result = self._run_cli(
+            "index_repository",
+            {"repo_path": repo_str, "mode": mode},
+        )
+
+        if isinstance(result, dict) and result.get("error"):
+            raise RuntimeError(f"CBM indexing failed: {result['error']}")
+
+        node_count = 0
+        edge_count = 0
+        if isinstance(result, dict):
+            node_count = result.get("nodes", 0)
+            edge_count = result.get("edges", 0)
+        logger.info(
+            f"CBM: indexing complete ({node_count} nodes, {edge_count} edges)."
+        )
+        self._indexed_repo = repo_str
+
+    def get_file_structure(
+        self, repo_path: Path, file_path: str
+    ) -> List[dict]:
+        """通过 ``search_graph`` 查询单个文件中的所有函数/类。"""
+        self.index_repo(repo_path)
+
+        results = self._search_structure_nodes(repo_path, file_pattern=file_path)
+        code_infos = []
+        for node in results:
+            code_info = self._node_to_code_info(repo_path, node)
+            if code_info:
+                code_infos.append(code_info)
+        return code_infos
+
+    def get_overall_structure(
+        self,
+        repo_path: Path,
+        file_path_reflections: Dict[str, str],
+        jump_files: List[str],
+    ) -> Dict[str, List[dict]]:
+        """查询全仓库所有 ``.py`` 文件的函数/类结构。"""
+        self.index_repo(repo_path)
+
+        all_nodes = self._search_structure_nodes(repo_path, file_pattern="*.py")
+        # 按 file_path 分组
+        structure: Dict[str, List[dict]] = {}
+        for node in all_nodes:
+            raw_file_path = node.get("file_path", "")
+            if not raw_file_path:
+                continue
+
+            # 跳过 jump_files（未跟踪文件）
+            if raw_file_path in jump_files:
+                continue
+
+            # 跳过 fake_file（latest_version 临时文件，任意扩展名）
+            if _is_latest_version_file(raw_file_path):
+                continue
+
+            code_info = self._node_to_code_info(repo_path, node)
+            if code_info:
+                structure.setdefault(raw_file_path, []).append(code_info)
+
+        return structure
+
+    def find_references(
+        self,
+        repo_path: Path,
+        file_path: str,
+        obj_name: str,
+        start_line: int,
+        name_column: int,
+        in_file_only: bool = False,
+    ) -> List[Tuple[str, int, int]]:
+        """通过 ``trace_path`` 查找对象的所有调用者。
+
+        返回 ``[(relative_file_path, line, column), ...]`` 列表。
+        """
+        self.index_repo(repo_path)
+        repo_str = str(repo_path)
+
+        # 尝试从缓存获取 qualified_name
+        qn = self._qn_cache.get((file_path, obj_name, start_line))
+
+        if qn is None:
+            # 回退:用短名搜索，取第一个匹配
+            qn = self._resolve_qualified_name(repo_path, file_path, obj_name, start_line)
+            if qn is None:
+                logger.debug(
+                    f"CBM: could not resolve qualified_name for "
+                    f"{file_path}/{obj_name} (line {start_line}), skipping references."
+                )
+                return []
+
+        result = self._run_cli(
+            "trace_path",
+            {
+                "function_name": qn,
+                "project": repo_str,
+                "direction": "inbound",
+                "mode": "calls",
+                "format": "json",
+                "depth": 10,
+            },
+        )
+
+        if not isinstance(result, dict):
+            return []
+
+        # trace_path JSON 格式: {"callers": [{"name":..., "qualified_name":..., "hop":...}, ...]}
+        # 或者可能返回 {"error": ...} / {"alternatives": [...]} 表示歧义
+        if result.get("error") or result.get("alternatives"):
+            logger.debug(
+                f"CBM trace_path returned ambiguity/error for {qn}: "
+                f"{result.get('error', 'ambiguous')}"
+            )
+            return []
+
+        callers = result.get("callers", [])
+        references: List[Tuple[str, int, int]] = []
+        for caller in callers:
+            caller_qn = caller.get("qualified_name", "")
+            if not caller_qn:
+                continue
+
+            # 从缓存获取 caller 的 file_path 和 start_line
+            caller_file, caller_line, _ = self._lookup_node_info(
+                repo_path, caller_qn
+            )
+            if not caller_file:
+                continue
+
+            column = 0
+            if in_file_only and caller_file != file_path:
+                continue
+            references.append((caller_file, caller_line, column))
+
+        return references
+
+    # ── 内部辅助方法 ─────────────────────────────────────────────
+
+    def _search_structure_nodes(
+        self,
+        repo_path: Path,
+        file_pattern: Optional[str] = None,
+    ) -> List[dict]:
+        """调用 ``search_graph`` 查询所有 Function/Method/Class 节点。
+
+        使用 ``format=json`` 获取完整 JSON 对象，包含 properties 中的
+        ``signature`` / ``return_type`` / ``docstring`` 等字段。
+        过滤掉非项目文件（如 ``<python-builtins>``）。
+        """
+        repo_str = str(repo_path)
+        args: dict = {
+            "project": repo_str,
+            "format": "json",
+            "limit": 10000,
+        }
+
+        # search_graph 的 label 过滤一次只支持一个 label，
+        # 所以分别查询 Function/Method 和 Class，然后合并。
+        all_nodes: List[dict] = []
+        for label in _STRUCTURE_LABELS:
+            args_label = {**args, "label": label}
+            try:
+                result = self._run_cli("search_graph", args_label)
+            except RuntimeError as e:
+                logger.warning(f"CBM search_graph failed for label={label}: {e}")
+                continue
+
+            if not isinstance(result, dict):
+                continue
+            if result.get("error"):
+                logger.warning(
+                    f"CBM search_graph error for label={label}: {result['error']}"
+                )
+                continue
+
+            nodes = result.get("results", [])
+            if file_pattern and file_pattern != "*.py":
+                # 客户端过滤文件（精确匹配或通配）
+                import fnmatch
+
+                nodes = [
+                    n for n in nodes if fnmatch.fnmatch(n.get("file_path", ""), file_pattern)
+                ]
+
+            # 过滤非项目文件
+            nodes = [
+                n for n in nodes if _is_project_file(n.get("file_path", ""))
+            ]
+
+            all_nodes.extend(nodes)
+
+        return all_nodes
+
+    def _node_to_code_info(
+        self, repo_path: Path, node: dict
+    ) -> Optional[dict]:
+        """将 CBM search_graph 的节点转换为 ``code_info`` 字典。
+
+        需要调用 ``get_code_snippet`` 获取源码（``source`` 字段）和
+        精确的 ``start_line`` / ``end_line``。
+        同时缓存 ``qualified_name`` 供 ``find_references`` 使用。
+        """
+        name = node.get("name", "")
+        if not name:
+            return None
+
+        label = node.get("label", "")
+        code_type = _LABEL_TO_TYPE.get(label, "FunctionDef")
+
+        file_path = node.get("file_path", "")
+        qualified_name = node.get("qualified_name", "")
+
+        # search_graph 不返回 start_line/end_line，需要从 get_code_snippet 获取
+        start_line = node.get("start_line", 0)
+        end_line = node.get("end_line", start_line)
+
+        # 从 signature 解析参数列表
+        signature = node.get("signature", "")
+        params = _parse_params_from_signature(signature)
+
+        # 获取源码和精确行号
+        code_content = ""
+        have_return = False
+        if qualified_name:
+            try:
+                snippet = self._run_cli(
+                    "get_code_snippet",
+                    {
+                        "qualified_name": qualified_name,
+                        "project": str(repo_path),
+                    },
+                )
+                if isinstance(snippet, dict) and not snippet.get("error"):
+                    code_content = snippet.get("source", "")
+                    # get_code_snippet 返回精确的 start_line/end_line
+                    if snippet.get("start_line"):
+                        start_line = snippet["start_line"]
+                    if snippet.get("end_line"):
+                        end_line = snippet["end_line"]
+                    # 如果 snippet 中有 signature，优先用它解析 params
+                    # （比 search_graph 的更准确）
+                    snippet_sig = snippet.get("signature", "")
+                    if snippet_sig:
+                        params = _parse_params_from_signature(snippet_sig)
+            except RuntimeError as e:
+                logger.debug(f"CBM get_code_snippet failed for {qualified_name}: {e}")
+
+        # 缓存 qualified_name → node info
+        if qualified_name and start_line > 0:
+            self._qn_cache[(file_path, name, start_line)] = qualified_name
+            self._node_info_cache[qualified_name] = (file_path, start_line, end_line)
+
+        # have_return: 检查源码中是否含 return 语句（与 FileHandler 逻辑一致）
+        if code_content:
+            have_return = "return" in code_content
+
+        # name_column: 从源码第一行查找名称位置（与 FileHandler 逻辑一致）
+        name_column = 0
+        if code_content:
+            first_line = code_content.split("\n", 1)[0]
+            pos = first_line.find(name)
+            if pos >= 0:
+                name_column = pos
+
+        return {
+            "type": code_type,
+            "name": name,
+            "md_content": [],
+            "code_start_line": start_line,
+            "code_end_line": end_line,
+            "params": params,
+            "have_return": have_return,
+            "code_content": code_content,
+            "name_column": name_column,
+        }
+
+    def _lookup_node_info(
+        self, repo_path: Path, qualified_name: str
+    ) -> Tuple[str, int, int]:
+        """通过缓存或 search_graph 查找节点的 (file_path, start_line, end_line)。
+
+        用于 ``find_references`` 中补全 trace_path 返回的 caller 信息。
+        """
+        # 先查缓存
+        if qualified_name in self._node_info_cache:
+            return self._node_info_cache[qualified_name]
+
+        # 通过 get_code_snippet 获取信息
+        try:
+            snippet = self._run_cli(
+                "get_code_snippet",
+                {
+                    "qualified_name": qualified_name,
+                    "project": str(repo_path),
+                },
+            )
+            if isinstance(snippet, dict) and not snippet.get("error"):
+                # file_path 在 snippet 中是绝对路径，需要转成相对路径
+                file_path = snippet.get("file_path", "")
+                repo_str = str(repo_path)
+                if file_path.startswith(repo_str):
+                    file_path = file_path[len(repo_str):].lstrip("/")
+
+                start_line = snippet.get("start_line", 0)
+                end_line = snippet.get("end_line", start_line)
+
+                if file_path and start_line > 0:
+                    self._node_info_cache[qualified_name] = (
+                        file_path,
+                        start_line,
+                        end_line,
+                    )
+                    return self._node_info_cache[qualified_name]
+        except RuntimeError:
+            pass
+
+        return ("", 0, 0)
+
+    def _resolve_qualified_name(
+        self,
+        repo_path: Path,
+        file_path: str,
+        obj_name: str,
+        start_line: int,
+    ) -> Optional[str]:
+        """通过 ``search_graph`` 精确查找对象的 ``qualified_name``。
+
+        当 ``_qn_cache`` 未命中时使用。通过 ``name_pattern`` + 文件路径过滤。
+        """
+        repo_str = str(repo_path)
+        try:
+            result = self._run_cli(
+                "search_graph",
+                {
+                    "project": repo_str,
+                    "name_pattern": obj_name,
+                    "file_pattern": file_path,
+                    "format": "json",
+                    "limit": 50,
+                },
+            )
+        except RuntimeError:
+            return None
+
+        if not isinstance(result, dict) or result.get("error"):
+            return None
+
+        for node in result.get("results", []):
+            if (
+                node.get("name") == obj_name
+                and node.get("file_path") == file_path
+            ):
+                qn = node.get("qualified_name", "")
+                if qn:
+                    self._qn_cache[(file_path, obj_name, start_line)] = qn
+                    return qn
+
+        # 回退:取第一个 name 匹配的节点
+        for node in result.get("results", []):
+            if node.get("name") == obj_name:
+                qn = node.get("qualified_name", "")
+                if qn:
+                    self._qn_cache[(file_path, obj_name, start_line)] = qn
+                    return qn
+
+        return None

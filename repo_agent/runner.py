@@ -22,6 +22,18 @@ from repo_agent.settings import SettingsManager
 from repo_agent.utils.meta_info_utils import delete_fake_files, make_fake_files
 
 
+def _source_to_md(file_path: str, file_extensions: list) -> str:
+    """将源文件路径的扩展名替换为 ``.md``。
+
+    支持任意已配置的源扩展名（如 ``.py`` / ``.java`` / ``.go``）。
+    """
+    for ext in file_extensions:
+        ext_with_dot = "." + ext
+        if file_path.endswith(ext_with_dot):
+            return file_path[: -len(ext_with_dot)] + ".md"
+    return file_path + ".md"
+
+
 class Runner:
     def __init__(self):
         self.setting = SettingsManager.get_setting()
@@ -37,6 +49,16 @@ class Runner:
             repo_path=self.setting.project.target_repo
         )
         self.chat_engine = ChatEngine(project_manager=self.project_manager)
+
+        # 触发代码智能后端索引（codebase_memory 后端会建 CBM 索引；
+        # builtin 后端为 no-op）
+        from repo_agent.code_intelligence import get_backend
+
+        self.backend = get_backend()
+        self.backend.index_repo(
+            repo_path=self.setting.project.target_repo,
+            mode=self.setting.project.cbm_index_mode,
+        )
 
         if not self.absolute_project_hierarchy_path.exists():
             file_path_reflections, jump_files = make_fake_files()
@@ -54,24 +76,25 @@ class Runner:
         )
         self.runner_lock = threading.Lock()
 
-    def get_all_pys(self, directory):
+    def get_all_source_files(self, directory):
         """
-        Get all Python files in the given directory.
+        Get all source files in the given directory matching the configured extensions.
 
         Args:
             directory (str): The directory to search.
 
         Returns:
-            list: A list of paths to all Python files.
+            list: A list of paths to all matching source files.
         """
-        python_files = []
+        source_files = []
+        extensions = self.setting.project.file_extensions
 
         for root, dirs, files in os.walk(directory):
             for file in files:
-                if file.endswith(".py"):
-                    python_files.append(os.path.join(root, file))
+                if any(file.endswith("." + ext) for ext in extensions):
+                    source_files.append(os.path.join(root, file))
 
-        return python_files
+        return source_files
 
     def generate_doc_for_a_single_item(self, doc_item: DocItem):
         """为一个对象生成文档"""
@@ -201,10 +224,18 @@ class Runner:
                 )
                 continue
 
-            # 确定并创建文件路径
-            file_path = Path(
-                self.setting.project.markdown_docs_name
-            ) / file_item.get_file_name().replace(".py", ".md")
+            # 确定并创建文件路径（将源文件扩展名替换为 .md）
+            file_name = file_item.get_file_name()
+            # 将任意源扩展名替换为 .md（如 Foo.py→Foo.md, Bar.java→Bar.md）
+            for ext in self.setting.project.file_extensions:
+                ext_with_dot = "." + ext
+                if file_name.endswith(ext_with_dot):
+                    file_name = file_name[: -len(ext_with_dot)] + ".md"
+                    break
+            else:
+                # 如果没有匹配到已知扩展名，直接追加 .md
+                file_name = file_name + ".md"
+            file_path = Path(self.setting.project.markdown_docs_name) / file_name
             abs_file_path = self.setting.project.target_repo / file_path
             logger.debug(f"Writing markdown to: {abs_file_path}")
 
@@ -401,7 +432,7 @@ class Runner:
             os.path.join(
                 self.project_manager.repo_path,
                 self.setting.project.markdown_docs_name,
-                file_handler.file_path.replace(".py", ".md"),
+                _source_to_md(file_handler.file_path, self.setting.project.file_extensions),
             ),
             markdown,
         )
@@ -460,7 +491,7 @@ class Runner:
             file_handler.write_file(
                 os.path.join(
                     self.setting.project.markdown_docs_name,
-                    file_handler.file_path.replace(".py", ".md"),
+                    _source_to_md(file_handler.file_path, self.setting.project.file_extensions),
                 ),
                 markdown,
             )

@@ -3,11 +3,13 @@
 import ast
 import json
 import os
+from pathlib import Path
 
 import git
 from colorama import Fore, Style
 from tqdm import tqdm
 
+from repo_agent.code_intelligence import get_backend
 from repo_agent.log import logger
 from repo_agent.settings import SettingsManager
 from repo_agent.utils.gitignore_checker import GitignoreChecker
@@ -28,6 +30,7 @@ class FileHandler:
         self.project_hierarchy = (
             setting.project.target_repo / setting.project.hierarchy_name
         )
+        self.backend = get_backend()
 
     def read_file(self):
         """
@@ -218,91 +221,23 @@ class FileHandler:
         """
         Generates the file structure for the given file path.
 
+        Delegates to the codebase-memory-mcp backend.
+
         Args:
             file_path (str): The relative path of the file.
 
         Returns:
-            dict: A dictionary containing the file path and the generated file structure.
-
-        Output example:
-        {
-            "function_name": {
-                "type": "function",
-                "start_line": 10,
-                ··· ···
-                "end_line": 20,
-                "parent": "class_name"
-            },
-            "class_name": {
-                "type": "class",
-                "start_line": 5,
-                ··· ···
-                "end_line": 25,
-                "parent": None
-            }
-        }
+            list: A list of code_info dictionaries for each function/class in the file.
         """
-        with open(os.path.join(self.repo_path, file_path), "r", encoding="utf-8") as f:
-            content = f.read()
-            structures = self.get_functions_and_classes(content)
-            file_objects = []  # 以列表的形式存储
-            for struct in structures:
-                structure_type, name, start_line, end_line, params = struct
-                code_info = self.get_obj_code_info(
-                    structure_type, name, start_line, end_line, params, file_path
-                )
-                file_objects.append(code_info)
-
-        return file_objects
+        return self.backend.get_file_structure(Path(self.repo_path), file_path)
 
     def generate_overall_structure(self, file_path_reflections, jump_files) -> dict:
-        """获取目标仓库的文件情况，通过AST-walk获取所有对象等情况。
+        """获取目标仓库的文件情况，通过后端获取所有对象等情况。
         对于jump_files: 不会parse，当做不存在
         """
-        repo_structure = {}
-        gitignore_checker = GitignoreChecker(
-            directory=self.repo_path,
-            gitignore_path=os.path.join(self.repo_path, ".gitignore"),
+        return self.backend.get_overall_structure(
+            Path(self.repo_path), file_path_reflections, jump_files
         )
-
-        bar = tqdm(gitignore_checker.check_files_and_folders())
-        for not_ignored_files in bar:
-            normal_file_names = not_ignored_files
-            if not_ignored_files in jump_files:
-                print(
-                    f"{Fore.LIGHTYELLOW_EX}[File-Handler] Unstaged AddFile, ignore this file: {Style.RESET_ALL}{normal_file_names}"
-                )
-                continue
-            elif not_ignored_files.endswith(latest_verison_substring):
-                print(
-                    f"{Fore.LIGHTYELLOW_EX}[File-Handler] Skip Latest Version, Using Git-Status Version]: {Style.RESET_ALL}{normal_file_names}"
-                )
-                continue
-            # elif not_ignored_files.endswith(latest_version):
-            #     """如果某文件被删除但没有暂存，文件系统有fake_file但没有对应的原始文件"""
-            #     for k,v in file_path_reflections.items():
-            #         if v == not_ignored_files and not os.path.exists(os.path.join(setting.project.target_repo, not_ignored_files)):
-            #             print(f"{Fore.LIGHTYELLOW_EX}[Unstaged DeleteFile] load fake-file-content: {Style.RESET_ALL}{k}")
-            #             normal_file_names = k #原来的名字
-            #             break
-            #     if normal_file_names == not_ignored_files:
-            #         continue
-
-            # if not_ignored_files in file_path_reflections.keys():
-            #     not_ignored_files = file_path_reflections[not_ignored_files] #获取fake_file_path
-            #     print(f"{Fore.LIGHTYELLOW_EX}[Unstaged ChangeFile] load fake-file-content: {Style.RESET_ALL}{normal_file_names}")
-
-            try:
-                repo_structure[normal_file_names] = self.generate_file_structure(
-                    not_ignored_files
-                )
-            except Exception as e:
-                logger.error(
-                    f"Alert: An error occurred while generating file structure for {not_ignored_files}: {e}"
-                )
-                continue
-            bar.set_description(f"generating repo structure: {not_ignored_files}")
-        return repo_structure
 
     def convert_to_markdown_file(self, file_path=None):
         """

@@ -20,6 +20,7 @@ from repo_agent.log import logger
 from repo_agent.multi_task_dispatch import Task, TaskManager
 from repo_agent.settings import SettingsManager
 from repo_agent.utils.meta_info_utils import latest_verison_substring
+from repo_agent.code_intelligence import get_backend
 
 
 @unique
@@ -197,7 +198,15 @@ class DocItem:
 
     def get_file_name(self):
         full_name = self.get_full_name()
-        return full_name.split(".py")[0] + ".py"
+        # 保留原始文件扩展名（.py / .java / .go 等），
+        # full_name 格式为 "dir/subdir/filename.ext/obj_name/..."
+        # 取第一个 '/' 分隔的路径部分中最后一个文件名
+        parts = full_name.split("/")
+        for part in parts:
+            if "." in part:
+                return part
+        # 退回到根节点名
+        return parts[0] if parts else full_name
 
     def get_full_name(self, strict=False):
         """获取从下到上所有的obj名字
@@ -535,12 +544,12 @@ class MetaInfo:
                 ):
                     in_file_only = True  # 作为加速，如果有白名单，白名单obj同文件夹下的也parse，但是只找同文件内的引用
 
-                reference_list = find_all_referencer(
+                reference_list = get_backend().find_references(
                     repo_path=self.repo_path,
-                    variable_name=now_obj.obj_name,
                     file_path=rel_file_path,
-                    line_number=now_obj.content["code_start_line"],
-                    column_number=now_obj.content["name_column"],
+                    obj_name=now_obj.obj_name,
+                    start_line=now_obj.content["code_start_line"],
+                    name_column=now_obj.content["name_column"],
                     in_file_only=in_file_only,
                 )
                 for referencer_pos in reference_list:  # 对于每个引用
