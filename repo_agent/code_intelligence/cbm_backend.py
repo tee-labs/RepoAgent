@@ -6,8 +6,8 @@
 
 CBM 会对仓库建索引（tree-sitter + SQLite 知识图谱），然后通过
 ``search_graph`` / ``trace_path`` / ``get_code_snippet`` 等工具查询。
-所有查询结果映射为与 ``FileHandler.get_obj_code_info`` 相同的 ``code_info``
-字典格式，确保下游消费者无需修改。
+所有查询结果映射为与 ``code_info`` 字典格式一致的输出，
+确保下游消费者（``DocItem``、``ChatEngine`` 等）无需修改。
 
 MCP CLI 响应信封格式::
 

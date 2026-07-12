@@ -1,8 +1,7 @@
 """代码智能后端的抽象基类。
 
-定义 AST 解析和引用关系分析的统一接口，使 RepoAgent 可以在
-``builtin``（ast + jedi）和 ``codebase_memory``（codebase-memory-mcp）
-后端之间切换。
+定义 AST 解析和引用关系分析的统一接口，供
+``codebase_memory``（codebase-memory-mcp）后端实现。
 """
 
 from __future__ import annotations

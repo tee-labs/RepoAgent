@@ -10,7 +10,6 @@ from enum import Enum, auto, unique
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
-import jedi
 from colorama import Fore, Style
 from prettytable import PrettyTable
 from tqdm import tqdm
@@ -300,36 +299,6 @@ class DocItem:
                 diff_status=diff_status,
                 ignore_list=ignore_list,
             )
-
-
-def find_all_referencer(
-    repo_path, variable_name, file_path, line_number, column_number, in_file_only=False
-):
-    """复制过来的之前的实现"""
-    script = jedi.Script(path=os.path.join(repo_path, file_path))
-    try:
-        if in_file_only:
-            references = script.get_references(
-                line=line_number, column=column_number, scope="file"
-            )
-        else:
-            references = script.get_references(line=line_number, column=column_number)
-        # 过滤出变量名为 variable_name 的引用，并返回它们的位置
-        variable_references = [ref for ref in references if ref.name == variable_name]
-        # if variable_name == "need_to_generate":
-        #     import pdb; pdb.set_trace()
-        return [
-            (os.path.relpath(ref.module_path, repo_path), ref.line, ref.column)
-            for ref in variable_references
-            if not (ref.line == line_number and ref.column == column_number)
-        ]
-    except Exception as e:
-        # 打印错误信息和相关参数
-        logger.error(f"Error occurred: {e}")
-        logger.error(
-            f"Parameters: variable_name={variable_name}, file_path={file_path}, line_number={line_number}, column_number={column_number}"
-        )
-        return []
 
 
 @dataclass

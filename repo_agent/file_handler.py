@@ -1,19 +1,13 @@
-# FileHandler 类，实现对文件的读写操作，这里的文件包括markdown文件和python文件
+# FileHandler 类，实现对文件的读写操作，这里的文件包括markdown文件和源代码文件
 # repo_agent/file_handler.py
-import ast
 import json
 import os
 from pathlib import Path
 
 import git
-from colorama import Fore, Style
-from tqdm import tqdm
 
 from repo_agent.code_intelligence import get_backend
-from repo_agent.log import logger
 from repo_agent.settings import SettingsManager
-from repo_agent.utils.gitignore_checker import GitignoreChecker
-from repo_agent.utils.meta_info_utils import latest_verison_substring
 
 
 class FileHandler:
@@ -44,57 +38,6 @@ class FileHandler:
         with open(abs_file_path, "r", encoding="utf-8") as file:
             content = file.read()
         return content
-
-    def get_obj_code_info(
-        self, code_type, code_name, start_line, end_line, params, file_path=None
-    ):
-        """
-        Get the code information for a given object.
-
-        Args:
-            code_type (str): The type of the code.
-            code_name (str): The name of the code.
-            start_line (int): The starting line number of the code.
-            end_line (int): The ending line number of the code.
-            parent (str): The parent of the code.
-            file_path (str, optional): The file path. Defaults to None.
-
-        Returns:
-            dict: A dictionary containing the code information.
-        """
-
-        code_info = {}
-        code_info["type"] = code_type
-        code_info["name"] = code_name
-        code_info["md_content"] = []
-        code_info["code_start_line"] = start_line
-        code_info["code_end_line"] = end_line
-        code_info["params"] = params
-
-        with open(
-            os.path.join(
-                self.repo_path, file_path if file_path != None else self.file_path
-            ),
-            "r",
-            encoding="utf-8",
-        ) as code_file:
-            lines = code_file.readlines()
-            code_content = "".join(lines[start_line - 1 : end_line])
-            # 获取对象名称在第一行代码中的位置
-            name_column = lines[start_line - 1].find(code_name)
-            # 判断代码中是否有return字样
-            if "return" in code_content:
-                have_return = True
-            else:
-                have_return = False
-
-            code_info["have_return"] = have_return
-            # # 使用 json.dumps 来转义字符串，并去掉首尾的引号
-            # code_info['code_content'] = json.dumps(code_content)[1:-1]
-            code_info["code_content"] = code_content
-            code_info["name_column"] = name_column
-
-        return code_info
 
     def write_file(self, file_path, content):
         """
@@ -141,81 +84,6 @@ class FileHandler:
                 previous_version = None  # The file may be newly added and not present in previous commits
 
         return current_version, previous_version
-
-    def get_end_lineno(self, node):
-        """
-        Get the end line number of a given node.
-
-        Args:
-            node: The node for which to find the end line number.
-
-        Returns:
-            int: The end line number of the node. Returns -1 if the node does not have a line number.
-        """
-        if not hasattr(node, "lineno"):
-            return -1  # 返回-1表示此节点没有行号
-
-        end_lineno = node.lineno
-        for child in ast.iter_child_nodes(node):
-            child_end = getattr(child, "end_lineno", None) or self.get_end_lineno(child)
-            if child_end > -1:  # 只更新当子节点有有效行号时
-                end_lineno = max(end_lineno, child_end)
-        return end_lineno
-
-    def add_parent_references(self, node, parent=None):
-        """
-        Adds a parent reference to each node in the AST.
-
-        Args:
-            node: The current node in the AST.
-
-        Returns:
-            None
-        """
-        for child in ast.iter_child_nodes(node):
-            child.parent = node
-            self.add_parent_references(child, node)
-
-    def get_functions_and_classes(self, code_content):
-        """
-        Retrieves all functions, classes, their parameters (if any), and their hierarchical relationships.
-        Output Examples: [('FunctionDef', 'AI_give_params', 86, 95, None, ['param1', 'param2']), ('ClassDef', 'PipelineEngine', 97, 104, None, []), ('FunctionDef', 'get_all_pys', 99, 104, 'PipelineEngine', ['param1'])]
-        On the example above, PipelineEngine is the Father structure for get_all_pys.
-
-        Args:
-            code_content: The code content of the whole file to be parsed.
-
-        Returns:
-            A list of tuples containing the type of the node (FunctionDef, ClassDef, AsyncFunctionDef),
-            the name of the node, the starting line number, the ending line number, the name of the parent node, and a list of parameters (if any).
-        """
-        tree = ast.parse(code_content)
-        self.add_parent_references(tree)
-        functions_and_classes = []
-        for node in ast.walk(tree):
-            if isinstance(node, (ast.FunctionDef, ast.ClassDef, ast.AsyncFunctionDef)):
-                # if node.name == "recursive_check":
-                #     import pdb; pdb.set_trace()
-                start_line = node.lineno
-                end_line = self.get_end_lineno(node)
-                # def get_recursive_parent_name(node):
-                #     now = node
-                #     while "parent" in dir(now):
-                #         if isinstance(now.parent, (ast.FunctionDef, ast.ClassDef, ast.AsyncFunctionDef)):
-                #             assert 'name' in dir(now.parent)
-                #             return now.parent.name
-                #         now = now.parent
-                #     return None
-                # parent_name = get_recursive_parent_name(node)
-                parameters = (
-                    [arg.arg for arg in node.args.args] if "args" in dir(node) else []
-                )
-                all_names = [item[1] for item in functions_and_classes]
-                # (parent_name == None or parent_name in all_names) and
-                functions_and_classes.append(
-                    (type(node).__name__, node.name, start_line, end_line, parameters)
-                )
-        return functions_and_classes
 
     def generate_file_structure(self, file_path):
         """

@@ -5,13 +5,12 @@ import subprocess
 import git
 from colorama import Fore, Style
 
-from repo_agent.file_handler import FileHandler
 from repo_agent.settings import SettingsManager
 
 
 class ChangeDetector:
     """
-    这个类需要处理文件的差异和变更检测，它可能会用到 FileHandler 类来访问文件系统。
+    这个类需要处理文件的差异和变更检测。
     ChangeDetector 类的核心在于能够识别自上次提交以来文件的变更。
     """
 
@@ -139,7 +138,7 @@ class ChangeDetector:
 
         Args:
             changed_lines (dict): A dictionary containing the line numbers where changes have occurred, {'added': [(line number, change content)], 'removed': [(line number, change content)]}
-            structures (list): The received is a list of function or class structures from get_functions_and_classes, each structure is composed of structure type, name, start line number, end line number, and parent structure name.
+            structures (list): The received is a list of function or class structures, each structure is composed of structure type, name, start line number, end line number, and parameters.
 
         Returns:
             dict: A dictionary containing the structures where changes have occurred, the key is the change type, and the value is a set of structure names and parent structure names.
@@ -275,21 +274,3 @@ class ChangeDetector:
             add_command = f"git -C {self.repo.working_dir} add {file_path}"
             subprocess.run(add_command, shell=True, check=True)
         return unstaged_files_meeting_conditions
-
-
-if __name__ == "__main__":
-    repo_path = "/path/to/your/repo/"
-    change_detector = ChangeDetector(repo_path)
-    changed_files = change_detector.get_staged_pys()
-    print(f"\nchanged_files:{changed_files}\n\n")
-    for file_path, is_new_file in changed_files.items():
-        changed_lines = change_detector.parse_diffs(
-            change_detector.get_file_diff(file_path, is_new_file)
-        )
-        # print("changed_lines:",changed_lines)
-        file_handler = FileHandler(repo_path=repo_path, file_path=file_path)
-        changes_in_pyfile = change_detector.identify_changes_in_structure(
-            changed_lines,
-            file_handler.get_functions_and_classes(file_handler.read_file()),
-        )
-        print(f"Changes in {file_path} Structures:{changes_in_pyfile}\n")
