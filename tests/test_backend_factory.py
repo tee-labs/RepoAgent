@@ -282,27 +282,40 @@ class TestGitignoreCheckerExtensions(unittest.TestCase):
             self.assertNotIn("baz.go", files)
 
 
-class TestCliFlagHyphenation(unittest.TestCase):
-    """测试 ``_run_cli`` 把 arg key 的下划线转成连字符 flag。
+class TestCliArgsFile(unittest.TestCase):
+    """测试 ``_run_cli`` 通过 ``--args-file`` 传递参数。
 
-    CBM CLI flags 规范形式是连字符（``--repo-path``、``--file-pattern`` 等），
-    Windows 构建会拒绝下划线形式（``--repo_path``）。此测试不依赖 CBM 二进制，
-    通过 mock ``subprocess.run`` 捕获实际命令并断言 flag 形式，覆盖 Linux
-    上"两种形式都接受"导致测不出的盲区。
+    CBM 经 Python shim 转发到 Go 二进制，在 Windows 上逐个 ``--flag value``
+    会经历多次命令行 tokenize（RepoAgent → shim 的 sys.argv → Go），含反斜杠
+    的路径可能丢失，导致 CBM 报 ``repo_path is required``。改用单个
+    ``--args-file <json>`` token 规避该问题。CBM 的 JSON 参数 key 用下划线
+    （``repo_path``），与 flag 形式（``--repo-path``）相反。
+
+    本测试不依赖 CBM 二进制，通过 mock ``subprocess.run`` 捕获命令并在调用
+    期间读取临时文件内容，验证：命令形式、payload 内容、临时文件清理。
     """
 
-    def _make_run_cli_mock(self):
-        """返回 (mock, captured_cmds)。
+    def _make_capture_mock(self):
+        """返回 (fake_run, records)。
 
-        mock 模拟一次成功的 CBM 调用：空 structuredContent。
-        captured_cmds 收集每次调用收到的 argv 列表。
+        records 收集每次调用收到的 (cmd, payload) —— payload 是从命令里的
+        ``--args-file`` 指向的临时文件中实时读出的（必须在 finally 删除前读取）。
         """
+        import json as _json
         from subprocess import CompletedProcess
 
-        captured: list[list[str]] = []
+        records: list[tuple[list[str], dict]] = []
 
         def fake_run(cmd, *args, **kwargs):
-            captured.append(list(cmd))
+            # 从 cmd 里找到 --args-file 的值并读出 payload。
+            payload = {}
+            try:
+                idx = cmd.index("--args-file")
+                with open(cmd[idx + 1]) as f:
+                    payload = _json.load(f)
+            except (ValueError, IndexError, OSError):
+                pass
+            records.append((list(cmd), payload))
             return CompletedProcess(
                 args=cmd,
                 returncode=0,
@@ -310,63 +323,42 @@ class TestCliFlagHyphenation(unittest.TestCase):
                 stderr="",
             )
 
-        return fake_run, captured
+        return fake_run, records
 
-    def test_index_repository_uses_hyphenated_repo_path(self):
-        """index_repository 的 repo_path → --repo-path。"""
-        from pathlib import Path
-
+    def test_command_uses_args_file_not_inline_flags(self):
+        """命令应是 ``... <tool> --args-file <path> --json``，没有逐个 ``--repo-path`` 等。"""
         from repo_agent.code_intelligence.cbm_backend import CodebaseMemoryBackend
 
         backend = CodebaseMemoryBackend(binary_path="codebase-memory-mcp")
-        backend._indexed_repo = None  # 强制走建索引分支，不命中缓存
-
-        fake_run, captured = self._make_run_cli_mock()
-
-        def fake_status(*a, **k):
-            # 让 index_status 检查返回"无索引"，从而进入 index_repository。
-            from subprocess import CompletedProcess
-
-            return CompletedProcess(
-                args=a,
-                returncode=0,
-                stdout='{"structuredContent": {"error": "no index"}, "isError": false}',
-                stderr="",
-            )
-
-        call_count = {"n": 0}
-
-        def run_dispatch(cmd, *args, **kwargs):
-            call_count["n"] += 1
-            # 第一次调用是 index_status，后续是 index_repository。
-            if call_count["n"] == 1:
-                return fake_status(cmd, *args, **kwargs)
-            return fake_run(cmd, *args, **kwargs)
+        fake_run, records = self._make_capture_mock()
 
         with patch(
             "repo_agent.code_intelligence.cbm_backend.subprocess.run",
-            side_effect=run_dispatch,
+            side_effect=fake_run,
         ):
-            backend.index_repo(Path("/tmp/sample-repo"), mode="full")
+            backend._run_cli(
+                "index_repository",
+                {"repo_path": "/tmp/repo", "mode": "full"},
+            )
 
-        # 至少有一次 index_repository 调用
-        index_calls = [c for c in captured if "index_repository" in c]
-        self.assertGreater(len(index_calls), 0, "should call index_repository")
-        cmd = index_calls[-1]
-        self.assertIn("--repo-path", cmd)
-        self.assertIn("/tmp/sample-repo", cmd)
-        self.assertIn("--mode", cmd)
-        # 关键：下划线形式不应出现。
+        self.assertEqual(len(records), 1)
+        cmd, _ = records[0]
+        # 命令骨架：binary cli <tool> --args-file <path> --json
+        self.assertEqual(cmd[0:2], ["codebase-memory-mcp", "cli"])
+        self.assertIn("index_repository", cmd)
+        self.assertIn("--args-file", cmd)
+        self.assertIn("--json", cmd)
+        # 关键：不应再出现逐个的内联 flag（旧的 --repo-path / --repo_path）。
+        self.assertNotIn("--repo-path", cmd)
         self.assertNotIn("--repo_path", cmd)
+        self.assertNotIn("--mode", cmd)
 
-    def test_search_graph_uses_hyphenated_flags(self):
-        """search_graph 的 name_pattern/file_pattern → 连字符。"""
-        from pathlib import Path
-
+    def test_payload_keeps_underscore_keys(self):
+        """临时文件里的 JSON key 保持下划线（CBM JSON 形式要求）。"""
         from repo_agent.code_intelligence.cbm_backend import CodebaseMemoryBackend
 
         backend = CodebaseMemoryBackend(binary_path="codebase-memory-mcp")
-        fake_run, captured = self._make_run_cli_mock()
+        fake_run, records = self._make_capture_mock()
 
         with patch(
             "repo_agent.code_intelligence.cbm_backend.subprocess.run",
@@ -383,43 +375,41 @@ class TestCliFlagHyphenation(unittest.TestCase):
                 },
             )
 
-        self.assertGreater(len(captured), 0)
-        cmd = captured[-1]
-        self.assertIn("--name-pattern", cmd)
-        self.assertIn("--file-pattern", cmd)
-        self.assertNotIn("--name_pattern", cmd)
-        self.assertNotIn("--file_pattern", cmd)
+        _, payload = records[0]
+        # key 保持原样（下划线），不转连字符。
+        self.assertIn("name_pattern", payload)
+        self.assertIn("file_pattern", payload)
+        self.assertNotIn("name-pattern", payload)
+        self.assertNotIn("file-pattern", payload)
+        self.assertEqual(payload["file_pattern"], "*.java")
+        self.assertEqual(payload["limit"], 50)
 
-    def test_trace_path_uses_hyphenated_function_name(self):
-        """trace_path 的 function_name → --function-name。"""
+    def test_none_values_filtered_from_payload(self):
+        """None 的参数不应进入 payload（避免 CBM 收到 null）。"""
         from repo_agent.code_intelligence.cbm_backend import CodebaseMemoryBackend
 
         backend = CodebaseMemoryBackend(binary_path="codebase-memory-mcp")
-        fake_run, captured = self._make_run_cli_mock()
+        fake_run, records = self._make_capture_mock()
 
         with patch(
             "repo_agent.code_intelligence.cbm_backend.subprocess.run",
             side_effect=fake_run,
         ):
             backend._run_cli(
-                "trace_path",
-                {
-                    "function_name": "mod.foo",
-                    "project": "/tmp/repo",
-                    "direction": "inbound",
-                },
+                "search_graph",
+                {"project": "/tmp/repo", "name_pattern": None, "label": "Class"},
             )
 
-        cmd = captured[-1]
-        self.assertIn("--function-name", cmd)
-        self.assertNotIn("--function_name", cmd)
+        _, payload = records[0]
+        self.assertNotIn("name_pattern", payload)
+        self.assertEqual(payload, {"project": "/tmp/repo", "label": "Class"})
 
-    def test_single_word_keys_unchanged(self):
-        """单 word key（project/label/mode）不受影响。"""
+    def test_temp_file_cleaned_up_after_call(self):
+        """调用结束后 --args-file 指向的临时文件应被删除。"""
         from repo_agent.code_intelligence.cbm_backend import CodebaseMemoryBackend
 
         backend = CodebaseMemoryBackend(binary_path="codebase-memory-mcp")
-        fake_run, captured = self._make_run_cli_mock()
+        fake_run, records = self._make_capture_mock()
 
         with patch(
             "repo_agent.code_intelligence.cbm_backend.subprocess.run",
@@ -427,8 +417,46 @@ class TestCliFlagHyphenation(unittest.TestCase):
         ):
             backend._run_cli("index_status", {"project": "/tmp/repo"})
 
-        cmd = captured[-1]
-        self.assertIn("--project", cmd)
+        cmd, _ = records[0]
+        args_path = cmd[cmd.index("--args-file") + 1]
+        import os
+
+        self.assertFalse(
+            os.path.exists(args_path), f"temp args file should be deleted: {args_path}"
+        )
+
+    def test_temp_file_cleaned_up_even_on_error(self):
+        """即使 CBM 返回错误，临时文件也应被清理（finally 兜底）。"""
+        import os
+        from subprocess import CompletedProcess
+
+        from repo_agent.code_intelligence.cbm_backend import CodebaseMemoryBackend
+
+        backend = CodebaseMemoryBackend(binary_path="codebase-memory-mcp")
+
+        captured_path = []
+
+        def fake_run(cmd, *args, **kwargs):
+            captured_path.append(cmd[cmd.index("--args-file") + 1])
+            return CompletedProcess(
+                args=cmd,
+                returncode=0,
+                stdout='{"isError": true, "content": [{"type":"text","text":"boom"}]}',
+                stderr="",
+            )
+
+        with patch(
+            "repo_agent.code_intelligence.cbm_backend.subprocess.run",
+            side_effect=fake_run,
+        ):
+            with self.assertRaises(RuntimeError):
+                backend._run_cli("index_repository", {"repo_path": "/tmp/repo"})
+
+        self.assertEqual(len(captured_path), 1)
+        self.assertFalse(
+            os.path.exists(captured_path[0]),
+            f"temp args file should be deleted even on error: {captured_path[0]}",
+        )
 
 
 if __name__ == "__main__":
