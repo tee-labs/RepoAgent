@@ -1,5 +1,7 @@
 import os
 
+from repo_agent.utils.meta_info_utils import _is_source_file
+
 
 class ProjectManager:
     def __init__(self, repo_path, project_hierarchy):
@@ -25,7 +27,7 @@ class ProjectManager:
                 path = os.path.join(root, name)
                 if os.path.isdir(path):
                     walk_dir(path, new_prefix)
-                elif os.path.isfile(path) and name.endswith(".py"):
+                elif os.path.isfile(path) and _is_source_file(name):
                     structure.append(new_prefix + name)
 
         structure = []

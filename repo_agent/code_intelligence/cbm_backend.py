@@ -54,6 +54,24 @@ def _is_project_file(file_path: str) -> bool:
     return not file_path.startswith(_NON_PROJECT_FILE_MARKERS)
 
 
+def _configured_file_extensions() -> Optional[List[str]]:
+    """从 settings 读取已配置的源文件扩展名列表。
+
+    返回 ``None`` 表示 Settings 尚未初始化（如单元测试直接调用后端时），
+    调用方据此决定是否按扩展名过滤。
+    """
+    try:
+        from repo_agent.settings import SettingsManager
+
+        settings = SettingsManager.get_setting()
+        extensions = settings.project.file_extensions
+    except Exception:
+        return None
+    if not extensions:
+        return None
+    return [ext.lstrip(".") for ext in extensions]
+
+
 def _parse_params_from_signature(signature: str) -> List[str]:
     """从 CBM 的 signature 字段解析参数名列表。
 
@@ -265,10 +283,29 @@ class CodebaseMemoryBackend(CodeIntelligenceBackend):
         file_path_reflections: Dict[str, str],
         jump_files: List[str],
     ) -> Dict[str, List[dict]]:
-        """查询全仓库所有 ``.py`` 文件的函数/类结构。"""
+        """查询全仓库所有已配置扩展名文件的函数/类结构。
+
+        扩展名来自 ``SettingsManager.get_setting().project.file_extensions``
+        （即 ``--file-extensions`` 传入的值，如 ``["java"]``）。
+        当 Settings 未初始化时（如单元测试直接调用），不过滤扩展名，
+        返回 CBM 已索引的全部节点。
+        """
         self.index_repo(repo_path)
 
-        all_nodes = self._search_structure_nodes(repo_path, file_pattern="*.py")
+        extensions = _configured_file_extensions()
+        all_nodes: List[dict] = []
+        if extensions:
+            # CBM search_graph 一次只接受一个 file_pattern，按扩展名分别查询后合并。
+            for ext in extensions:
+                ext = ext.lstrip(".")
+                all_nodes.extend(
+                    self._search_structure_nodes(
+                        repo_path, file_pattern=f"*.{ext}"
+                    )
+                )
+        else:
+            # Settings 未初始化：不过滤扩展名，返回全部结构节点。
+            all_nodes = self._search_structure_nodes(repo_path, file_pattern=None)
         # 按 file_path 分组
         structure: Dict[str, List[dict]] = {}
         for node in all_nodes:
@@ -404,8 +441,8 @@ class CodebaseMemoryBackend(CodeIntelligenceBackend):
                 continue
 
             nodes = result.get("results", [])
-            if file_pattern and file_pattern != "*.py":
-                # 客户端过滤文件（精确匹配或通配）
+            if file_pattern:
+                # 客户端按 file_pattern 过滤文件（如 "*.java" / "*.py"）。
                 import fnmatch
 
                 nodes = [

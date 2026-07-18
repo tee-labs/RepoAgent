@@ -294,6 +294,25 @@ public class Main {
             check=False,
         )
 
+        # 配置 file_extensions=["java"]，模拟 `--file-extensions java` 的真实用法，
+        # 使 get_overall_structure 按扩展名过滤时能命中 .java 文件。
+        from repo_agent.settings import SettingsManager
+
+        SettingsManager.initialize_with_params(
+            target_repo=cls.repo_path,
+            markdown_docs_name="markdown_docs",
+            hierarchy_name=".project_doc_record",
+            ignore_list=[],
+            language="English",
+            max_thread_count=4,
+            log_level="INFO",
+            model="gpt-4o-mini",
+            temperature=0.2,
+            request_timeout=60,
+            openai_base_url="https://api.openai.com/v1",
+            file_extensions=["java"],
+        )
+
         cls.backend = CodebaseMemoryBackend()
         cls.backend.index_repo(cls.repo_path, mode="full")
 
