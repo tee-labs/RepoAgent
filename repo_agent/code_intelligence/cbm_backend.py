@@ -21,10 +21,8 @@ MCP CLI 响应信封格式::
 from __future__ import annotations
 
 import json
-import os
 import re
 import subprocess
-import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -120,19 +118,23 @@ class CodebaseMemoryBackend(CodeIntelligenceBackend):
     # ── CLI 调用基础设施 ──────────────────────────────────────────
 
     def _run_cli(self, tool: str, args: dict) -> Any:
-        """调用 ``codebase-memory-mcp cli <tool> --json``，返回解包后的结果。
+        """调用 ``codebase-memory-mcp cli <tool> '<json>' --json``，返回解包结果。
 
-        通过 ``--args-file`` 传入一个临时 JSON 文件承载工具参数，而非逐个
-        ``--flag value`` 拼到命令行上。原因：CBM 是经 Python shim 转发的 Go
-        二进制，在 Windows 上 flag 形式会经历多次命令行 tokenize（RepoAgent
-        → ``list2cmdline`` → shim 的 ``sys.argv`` → Go），含反斜杠的路径
-        （如 ``D:\\source\\repo``）和 flag/值边界在此过程中可能丢失，导致
-        CBM 报 ``repo_path is required``。``--args-file`` 是单个文件名 token，
-        完全规避命令行 tokenize，且是 CBM 文档推荐的主调用形式，跨平台一致。
+        参数以**单个位置参数 raw-JSON** 传递，而非逐个 ``--flag value`` 或
+        ``--args-file``。这是唯一在实测中同时兼容 CBM **0.8.1 与 0.9.0** 的形式：
 
-        注意：CBM 的 JSON 参数 key 用**下划线**（``repo_path``、
-        ``file_pattern``），与 flag 形式（``--repo-path``）相反——此差异已在
-        index_repository / search_graph / trace_path 等工具上实测确认。
+        - ``--flag value``：0.9.0 接受连字符 flag（``--repo-path``），0.8.1 不认；
+          下划线 flag 两个版本行为不一致。不可靠。
+        - ``--args-file``：**0.8.1 完全不支持**（实测 Windows 0.8.1 报
+          ``repo_path is required``，0.9.0 才有此 flag）。不可靠。
+        - raw-JSON 位置参数：0.8.1 和 0.9.0 都接受，且 JSON key 用**下划线**
+          （``repo_path``、``file_pattern``），与调用点的 snake_case 一致。
+
+        （上述结论由 ``scripts/diagnose_cbm.py`` 在 Windows 0.8.1 与 Linux 0.9.0
+        上对四种形式逐一实测得出。）
+
+        单个 JSON 字符串由 ``subprocess.run(list)`` 作为一个 argv token 传递，
+        无需关心各平台的命令行 tokenize 差异。
 
         自动解包 MCP 响应信封，返回 ``structuredContent``（或退回到
         ``content[0].text`` 解析出的 JSON）。
@@ -147,99 +149,86 @@ class CodebaseMemoryBackend(CodeIntelligenceBackend):
         Raises:
             RuntimeError: 如果二进制不存在、调用失败或返回错误。
         """
-        # 过滤 None；False 的布尔值也不传（语义同原先的 bool 分支）。
+        # 过滤 None；空 dict 也允许（某些工具无必填参数）。
         payload = {
             key: value for key, value in args.items() if value is not None
         }
+        payload_json = json.dumps(payload, ensure_ascii=False)
 
-        # 写临时 JSON 文件。args-file 由 CBM 进程在调用期间读取，必须存活到
-        # subprocess.run 返回之后，故 delete=False + finally 清理。
-        with tempfile.NamedTemporaryFile(
-            mode="w", suffix=".json", prefix="cbm_args_", delete=False
-        ) as args_file:
-            json.dump(payload, args_file, ensure_ascii=False)
-            args_file.flush()
-            args_path = args_file.name
+        # raw-JSON 作为单个位置参数放在 tool 之后、--json 之前。
+        cmd = [self.binary, "cli", tool, payload_json, "--json"]
 
-        cmd = [self.binary, "cli", tool, "--args-file", args_path, "--json"]
-
-        logger.debug(f"CBM CLI: {' '.join(cmd)}  (payload={payload!r})")
+        logger.debug(
+            "CBM CLI: " + cmd[0] + " " + cmd[1] + " " + cmd[2] + " PAYLOAD_JSON --json"
+        )
         try:
-            try:
-                result = subprocess.run(
-                    cmd,
-                    capture_output=True,
-                    text=True,
-                    timeout=600,
-                )
-            except FileNotFoundError:
-                raise RuntimeError(
-                    f"codebase-memory-mcp binary not found at '{self.binary}'. "
-                    f"Install it via `pip install codebase-memory-mcp` or "
-                    f"download from https://github.com/DeusData/codebase-memory-mcp/releases."
-                )
-            except subprocess.TimeoutExpired:
-                raise RuntimeError(
-                    f"codebase-memory-mcp CLI timed out (600s) for tool '{tool}'."
-                )
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=600,
+            )
+        except FileNotFoundError:
+            raise RuntimeError(
+                f"codebase-memory-mcp binary not found at '{self.binary}'. "
+                f"Install it via `pip install codebase-memory-mcp` or "
+                f"download from https://github.com/DeusData/codebase-memory-mcp/releases."
+            )
+        except subprocess.TimeoutExpired:
+            raise RuntimeError(
+                f"codebase-memory-mcp CLI timed out (600s) for tool '{tool}'."
+            )
 
-            if result.returncode != 0:
-                stderr = result.stderr.strip()
-                raise RuntimeError(
-                    f"codebase-memory-mcp CLI failed (exit {result.returncode}) "
-                    f"for tool '{tool}': {stderr}"
-                )
+        if result.returncode != 0:
+            stderr = result.stderr.strip()
+            raise RuntimeError(
+                f"codebase-memory-mcp CLI failed (exit {result.returncode}) "
+                f"for tool '{tool}': {stderr}"
+            )
 
-            stdout = result.stdout.strip()
-            if not stdout:
-                raise RuntimeError(
-                    f"codebase-memory-mcp CLI returned empty output for tool '{tool}'."
-                )
+        stdout = result.stdout.strip()
+        if not stdout:
+            raise RuntimeError(
+                f"codebase-memory-mcp CLI returned empty output for tool '{tool}'."
+            )
 
-            try:
-                envelope = json.loads(stdout)
-            except json.JSONDecodeError as e:
-                raise RuntimeError(
-                    f"codebase-memory-mcp CLI returned invalid JSON for tool '{tool}': {e}\n"
-                    f"Output: {stdout[:500]}"
-                )
+        try:
+            envelope = json.loads(stdout)
+        except json.JSONDecodeError as e:
+            raise RuntimeError(
+                f"codebase-memory-mcp CLI returned invalid JSON for tool '{tool}': {e}\n"
+                f"Output: {stdout[:500]}"
+            )
 
-            # 解包 MCP 响应信封
-            if isinstance(envelope, dict):
-                # 检查是否是错误响应
-                if envelope.get("isError"):
-                    content = envelope.get("content", [])
-                    error_text = ""
-                    if content and isinstance(content, list):
-                        error_text = content[0].get("text", "")
-                    raise RuntimeError(
-                        f"codebase-memory-mcp tool '{tool}' returned error: {error_text}\n"
-                        f"  command: {' '.join(cmd)}\n"
-                        f"  payload: {payload!r}"
-                    )
-
-                # 优先使用 structuredContent（已解析的 JSON）
-                structured = envelope.get("structuredContent")
-                if structured is not None:
-                    return structured
-
-                # 退回到 content[0].text（需要二次解析）
+        # 解包 MCP 响应信封
+        if isinstance(envelope, dict):
+            # 检查是否是错误响应
+            if envelope.get("isError"):
                 content = envelope.get("content", [])
+                error_text = ""
                 if content and isinstance(content, list):
-                    text = content[0].get("text", "")
-                    if text:
-                        try:
-                            return json.loads(text)
-                        except json.JSONDecodeError:
-                            return text
+                    error_text = content[0].get("text", "")
+                raise RuntimeError(
+                    f"codebase-memory-mcp tool '{tool}' returned error: {error_text}\n"
+                    f"  payload: {payload!r}"
+                )
 
-            return envelope
-        finally:
-            # 清理承载参数的临时 JSON 文件（无论成功/失败都要删）。
-            try:
-                os.unlink(args_path)
-            except OSError:
-                pass
+            # 优先使用 structuredContent（已解析的 JSON）
+            structured = envelope.get("structuredContent")
+            if structured is not None:
+                return structured
+
+            # 退回到 content[0].text（需要二次解析）
+            content = envelope.get("content", [])
+            if content and isinstance(content, list):
+                text = content[0].get("text", "")
+                if text:
+                    try:
+                        return json.loads(text)
+                    except json.JSONDecodeError:
+                        return text
+
+        return envelope
 
     # ── CodeIntelligenceBackend 实现 ─────────────────────────────
 

@@ -282,24 +282,27 @@ class TestGitignoreCheckerExtensions(unittest.TestCase):
             self.assertNotIn("baz.go", files)
 
 
-class TestCliArgsFile(unittest.TestCase):
-    """测试 ``_run_cli`` 通过 ``--args-file`` 传递参数。
+class TestCliRawJsonArgs(unittest.TestCase):
+    """测试 ``_run_cli`` 通过单个位置参数 raw-JSON 传递参数。
 
-    CBM 经 Python shim 转发到 Go 二进制，在 Windows 上逐个 ``--flag value``
-    会经历多次命令行 tokenize（RepoAgent → shim 的 sys.argv → Go），含反斜杠
-    的路径可能丢失，导致 CBM 报 ``repo_path is required``。改用单个
-    ``--args-file <json>`` token 规避该问题。CBM 的 JSON 参数 key 用下划线
-    （``repo_path``），与 flag 形式（``--repo-path``）相反。
+    CBM 在 0.8.1 与 0.9.0 上的参数形式支持不一致（由
+    ``scripts/diagnose_cbm.py`` 在 Windows 0.8.1 + Linux 0.9.0 上对四种形式
+    逐一实测确认）：
 
-    本测试不依赖 CBM 二进制，通过 mock ``subprocess.run`` 捕获命令并在调用
-    期间读取临时文件内容，验证：命令形式、payload 内容、临时文件清理。
+    - ``--flag value``：0.9.0 接受连字符 flag，0.8.1 不认 → 不可靠。
+    - ``--args-file``：**0.8.1 完全不支持** → 不可靠。
+    - **raw-JSON 位置参数**：两个版本都接受，JSON key 用下划线（``repo_path``）
+      → 唯一跨版本兼容的形式，本类锁定它。
+
+    本测试不依赖 CBM 二进制，通过 mock ``subprocess.run`` 捕获实际命令，
+    验证命令形状（raw-JSON 作为位置参数）、payload 内容、错误信息。
     """
 
     def _make_capture_mock(self):
         """返回 (fake_run, records)。
 
-        records 收集每次调用收到的 (cmd, payload) —— payload 是从命令里的
-        ``--args-file`` 指向的临时文件中实时读出的（必须在 finally 删除前读取）。
+        records 收集每次调用收到的 (cmd, payload)——payload 是从命令中第 3 个
+        位置参数（raw-JSON 字符串）反序列化出来的。
         """
         import json as _json
         from subprocess import CompletedProcess
@@ -307,13 +310,11 @@ class TestCliArgsFile(unittest.TestCase):
         records: list[tuple[list[str], dict]] = []
 
         def fake_run(cmd, *args, **kwargs):
-            # 从 cmd 里找到 --args-file 的值并读出 payload。
+            # cmd 形如 [binary, "cli", tool, "<json>", "--json"]
             payload = {}
             try:
-                idx = cmd.index("--args-file")
-                with open(cmd[idx + 1]) as f:
-                    payload = _json.load(f)
-            except (ValueError, IndexError, OSError):
+                payload = _json.loads(cmd[3])
+            except (IndexError, ValueError, TypeError):
                 pass
             records.append((list(cmd), payload))
             return CompletedProcess(
@@ -325,8 +326,10 @@ class TestCliArgsFile(unittest.TestCase):
 
         return fake_run, records
 
-    def test_command_uses_args_file_not_inline_flags(self):
-        """命令应是 ``... <tool> --args-file <path> --json``，没有逐个 ``--repo-path`` 等。"""
+    def test_command_passes_payload_as_positional_json(self):
+        """命令应是 ``[binary, cli, <tool>, <json-string>, --json]``。"""
+        import json as _json
+
         from repo_agent.code_intelligence.cbm_backend import CodebaseMemoryBackend
 
         backend = CodebaseMemoryBackend(binary_path="codebase-memory-mcp")
@@ -342,19 +345,20 @@ class TestCliArgsFile(unittest.TestCase):
             )
 
         self.assertEqual(len(records), 1)
-        cmd, _ = records[0]
-        # 命令骨架：binary cli <tool> --args-file <path> --json
-        self.assertEqual(cmd[0:2], ["codebase-memory-mcp", "cli"])
-        self.assertIn("index_repository", cmd)
-        self.assertIn("--args-file", cmd)
-        self.assertIn("--json", cmd)
-        # 关键：不应再出现逐个的内联 flag（旧的 --repo-path / --repo_path）。
-        self.assertNotIn("--repo-path", cmd)
-        self.assertNotIn("--repo_path", cmd)
+        cmd, payload = records[0]
+        # 骨架：binary cli <tool> <json-string> --json
+        self.assertEqual(cmd[0:3], ["codebase-memory-mcp", "cli", "index_repository"])
+        self.assertEqual(cmd[4], "--json")
+        # 第 4 个元素是合法 JSON，解析后等于 payload。
+        self.assertEqual(_json.loads(cmd[3]), payload)
+        # 关键：不应出现任何逐个 flag 或 --args-file。
+        for token in cmd:
+            self.assertFalse(token.startswith("--repo"), f"unexpected flag: {token}")
+        self.assertNotIn("--args-file", cmd)
         self.assertNotIn("--mode", cmd)
 
     def test_payload_keeps_underscore_keys(self):
-        """临时文件里的 JSON key 保持下划线（CBM JSON 形式要求）。"""
+        """raw-JSON 的 key 保持下划线（CBM JSON 形式要求）。"""
         from repo_agent.code_intelligence.cbm_backend import CodebaseMemoryBackend
 
         backend = CodebaseMemoryBackend(binary_path="codebase-memory-mcp")
@@ -404,8 +408,10 @@ class TestCliArgsFile(unittest.TestCase):
         self.assertNotIn("name_pattern", payload)
         self.assertEqual(payload, {"project": "/tmp/repo", "label": "Class"})
 
-    def test_temp_file_cleaned_up_after_call(self):
-        """调用结束后 --args-file 指向的临时文件应被删除。"""
+    def test_paths_with_backslashes_survive(self):
+        """Windows 风格的反斜杠路径应原样出现在 JSON 字符串里。"""
+        import json as _json
+
         from repo_agent.code_intelligence.cbm_backend import CodebaseMemoryBackend
 
         backend = CodebaseMemoryBackend(binary_path="codebase-memory-mcp")
@@ -415,29 +421,24 @@ class TestCliArgsFile(unittest.TestCase):
             "repo_agent.code_intelligence.cbm_backend.subprocess.run",
             side_effect=fake_run,
         ):
-            backend._run_cli("index_status", {"project": "/tmp/repo"})
+            backend._run_cli(
+                "index_repository",
+                {"repo_path": r"D:\source\NGCRM\crm\jbusiness", "mode": "full"},
+            )
 
-        cmd, _ = records[0]
-        args_path = cmd[cmd.index("--args-file") + 1]
-        import os
+        _, payload = records[0]
+        # 反斜杠路径应完整保留（JSON 里会被转义为 \\，反序列化后还原）。
+        self.assertEqual(payload["repo_path"], r"D:\source\NGCRM\crm\jbusiness")
 
-        self.assertFalse(
-            os.path.exists(args_path), f"temp args file should be deleted: {args_path}"
-        )
-
-    def test_temp_file_cleaned_up_even_on_error(self):
-        """即使 CBM 返回错误，临时文件也应被清理（finally 兜底）。"""
-        import os
+    def test_error_message_includes_payload(self):
+        """CBM 返回错误时，异常信息应携带 payload 便于排查。"""
         from subprocess import CompletedProcess
 
         from repo_agent.code_intelligence.cbm_backend import CodebaseMemoryBackend
 
         backend = CodebaseMemoryBackend(binary_path="codebase-memory-mcp")
 
-        captured_path = []
-
         def fake_run(cmd, *args, **kwargs):
-            captured_path.append(cmd[cmd.index("--args-file") + 1])
             return CompletedProcess(
                 args=cmd,
                 returncode=0,
@@ -452,17 +453,10 @@ class TestCliArgsFile(unittest.TestCase):
             with self.assertRaises(RuntimeError) as ctx:
                 backend._run_cli("index_repository", {"repo_path": "/tmp/repo"})
 
-        self.assertEqual(len(captured_path), 1)
-        self.assertFalse(
-            os.path.exists(captured_path[0]),
-            f"temp args file should be deleted even on error: {captured_path[0]}",
-        )
-        # 错误信息应携带命令和 payload，便于 Windows 等环境排查 CBM 入参。
         msg = str(ctx.exception)
         self.assertIn("index_repository", msg)
         self.assertIn("boom", msg)
         self.assertIn("repo_path", msg)  # payload 里有 repo_path
-        self.assertIn("--args-file", msg)  # 命令里有 --args-file
 
 
 if __name__ == "__main__":
