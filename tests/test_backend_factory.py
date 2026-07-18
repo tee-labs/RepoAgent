@@ -282,5 +282,154 @@ class TestGitignoreCheckerExtensions(unittest.TestCase):
             self.assertNotIn("baz.go", files)
 
 
+class TestCliFlagHyphenation(unittest.TestCase):
+    """测试 ``_run_cli`` 把 arg key 的下划线转成连字符 flag。
+
+    CBM CLI flags 规范形式是连字符（``--repo-path``、``--file-pattern`` 等），
+    Windows 构建会拒绝下划线形式（``--repo_path``）。此测试不依赖 CBM 二进制，
+    通过 mock ``subprocess.run`` 捕获实际命令并断言 flag 形式，覆盖 Linux
+    上"两种形式都接受"导致测不出的盲区。
+    """
+
+    def _make_run_cli_mock(self):
+        """返回 (mock, captured_cmds)。
+
+        mock 模拟一次成功的 CBM 调用：空 structuredContent。
+        captured_cmds 收集每次调用收到的 argv 列表。
+        """
+        from subprocess import CompletedProcess
+
+        captured: list[list[str]] = []
+
+        def fake_run(cmd, *args, **kwargs):
+            captured.append(list(cmd))
+            return CompletedProcess(
+                args=cmd,
+                returncode=0,
+                stdout='{"structuredContent": {}, "isError": false}',
+                stderr="",
+            )
+
+        return fake_run, captured
+
+    def test_index_repository_uses_hyphenated_repo_path(self):
+        """index_repository 的 repo_path → --repo-path。"""
+        from pathlib import Path
+
+        from repo_agent.code_intelligence.cbm_backend import CodebaseMemoryBackend
+
+        backend = CodebaseMemoryBackend(binary_path="codebase-memory-mcp")
+        backend._indexed_repo = None  # 强制走建索引分支，不命中缓存
+
+        fake_run, captured = self._make_run_cli_mock()
+
+        def fake_status(*a, **k):
+            # 让 index_status 检查返回"无索引"，从而进入 index_repository。
+            from subprocess import CompletedProcess
+
+            return CompletedProcess(
+                args=a,
+                returncode=0,
+                stdout='{"structuredContent": {"error": "no index"}, "isError": false}',
+                stderr="",
+            )
+
+        call_count = {"n": 0}
+
+        def run_dispatch(cmd, *args, **kwargs):
+            call_count["n"] += 1
+            # 第一次调用是 index_status，后续是 index_repository。
+            if call_count["n"] == 1:
+                return fake_status(cmd, *args, **kwargs)
+            return fake_run(cmd, *args, **kwargs)
+
+        with patch(
+            "repo_agent.code_intelligence.cbm_backend.subprocess.run",
+            side_effect=run_dispatch,
+        ):
+            backend.index_repo(Path("/tmp/sample-repo"), mode="full")
+
+        # 至少有一次 index_repository 调用
+        index_calls = [c for c in captured if "index_repository" in c]
+        self.assertGreater(len(index_calls), 0, "should call index_repository")
+        cmd = index_calls[-1]
+        self.assertIn("--repo-path", cmd)
+        self.assertIn("/tmp/sample-repo", cmd)
+        self.assertIn("--mode", cmd)
+        # 关键：下划线形式不应出现。
+        self.assertNotIn("--repo_path", cmd)
+
+    def test_search_graph_uses_hyphenated_flags(self):
+        """search_graph 的 name_pattern/file_pattern → 连字符。"""
+        from pathlib import Path
+
+        from repo_agent.code_intelligence.cbm_backend import CodebaseMemoryBackend
+
+        backend = CodebaseMemoryBackend(binary_path="codebase-memory-mcp")
+        fake_run, captured = self._make_run_cli_mock()
+
+        with patch(
+            "repo_agent.code_intelligence.cbm_backend.subprocess.run",
+            side_effect=fake_run,
+        ):
+            backend._run_cli(
+                "search_graph",
+                {
+                    "project": "/tmp/repo",
+                    "name_pattern": "foo",
+                    "file_pattern": "*.java",
+                    "label": "Class",
+                    "limit": 50,
+                },
+            )
+
+        self.assertGreater(len(captured), 0)
+        cmd = captured[-1]
+        self.assertIn("--name-pattern", cmd)
+        self.assertIn("--file-pattern", cmd)
+        self.assertNotIn("--name_pattern", cmd)
+        self.assertNotIn("--file_pattern", cmd)
+
+    def test_trace_path_uses_hyphenated_function_name(self):
+        """trace_path 的 function_name → --function-name。"""
+        from repo_agent.code_intelligence.cbm_backend import CodebaseMemoryBackend
+
+        backend = CodebaseMemoryBackend(binary_path="codebase-memory-mcp")
+        fake_run, captured = self._make_run_cli_mock()
+
+        with patch(
+            "repo_agent.code_intelligence.cbm_backend.subprocess.run",
+            side_effect=fake_run,
+        ):
+            backend._run_cli(
+                "trace_path",
+                {
+                    "function_name": "mod.foo",
+                    "project": "/tmp/repo",
+                    "direction": "inbound",
+                },
+            )
+
+        cmd = captured[-1]
+        self.assertIn("--function-name", cmd)
+        self.assertNotIn("--function_name", cmd)
+
+    def test_single_word_keys_unchanged(self):
+        """单 word key（project/label/mode）不受影响。"""
+        from repo_agent.code_intelligence.cbm_backend import CodebaseMemoryBackend
+
+        backend = CodebaseMemoryBackend(binary_path="codebase-memory-mcp")
+        fake_run, captured = self._make_run_cli_mock()
+
+        with patch(
+            "repo_agent.code_intelligence.cbm_backend.subprocess.run",
+            side_effect=fake_run,
+        ):
+            backend._run_cli("index_status", {"project": "/tmp/repo"})
+
+        cmd = captured[-1]
+        self.assertIn("--project", cmd)
+
+
 if __name__ == "__main__":
     unittest.main()

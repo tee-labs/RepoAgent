@@ -138,14 +138,19 @@ class CodebaseMemoryBackend(CodeIntelligenceBackend):
         for key, value in args.items():
             if value is None:
                 continue
+            # CBM CLI flags use the canonical hyphenated form (--repo-path,
+            # --file-pattern, ...). Convert Python's underscored arg keys so
+            # callers keep idiomatic snake_case. Windows builds reject the
+            # underscored form; Linux accepts both, so this is load-bearing.
+            flag = key.replace("_", "-")
             if isinstance(value, bool):
                 if value:
-                    cmd.append(f"--{key}")
+                    cmd.append(f"--{flag}")
             elif isinstance(value, list):
-                cmd.append(f"--{key}")
+                cmd.append(f"--{flag}")
                 cmd.append(",".join(str(v) for v in value))
             else:
-                cmd.append(f"--{key}")
+                cmd.append(f"--{flag}")
                 cmd.append(str(value))
 
         logger.debug(f"CBM CLI: {' '.join(cmd)}")
