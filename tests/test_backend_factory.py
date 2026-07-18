@@ -449,7 +449,7 @@ class TestCliArgsFile(unittest.TestCase):
             "repo_agent.code_intelligence.cbm_backend.subprocess.run",
             side_effect=fake_run,
         ):
-            with self.assertRaises(RuntimeError):
+            with self.assertRaises(RuntimeError) as ctx:
                 backend._run_cli("index_repository", {"repo_path": "/tmp/repo"})
 
         self.assertEqual(len(captured_path), 1)
@@ -457,6 +457,12 @@ class TestCliArgsFile(unittest.TestCase):
             os.path.exists(captured_path[0]),
             f"temp args file should be deleted even on error: {captured_path[0]}",
         )
+        # 错误信息应携带命令和 payload，便于 Windows 等环境排查 CBM 入参。
+        msg = str(ctx.exception)
+        self.assertIn("index_repository", msg)
+        self.assertIn("boom", msg)
+        self.assertIn("repo_path", msg)  # payload 里有 repo_path
+        self.assertIn("--args-file", msg)  # 命令里有 --args-file
 
 
 if __name__ == "__main__":

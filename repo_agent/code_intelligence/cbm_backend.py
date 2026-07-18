@@ -213,7 +213,9 @@ class CodebaseMemoryBackend(CodeIntelligenceBackend):
                     if content and isinstance(content, list):
                         error_text = content[0].get("text", "")
                     raise RuntimeError(
-                        f"codebase-memory-mcp tool '{tool}' returned error: {error_text}"
+                        f"codebase-memory-mcp tool '{tool}' returned error: {error_text}\n"
+                        f"  command: {' '.join(cmd)}\n"
+                        f"  payload: {payload!r}"
                     )
 
                 # 优先使用 structuredContent（已解析的 JSON）
