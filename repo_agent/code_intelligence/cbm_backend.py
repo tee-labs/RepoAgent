@@ -23,6 +23,7 @@ from __future__ import annotations
 import json
 import re
 import subprocess
+import threading
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -151,6 +152,10 @@ class CodebaseMemoryBackend(CodeIntelligenceBackend):
         # 路径→名解析。派生规则与路径格式相关（\ : / 处理不同），不能本地复刻，
         # 故从 index 响应里读出并缓存。
         self._project_name_cache: Dict[str, str] = {}
+        # 并发缓存锁：parse_reference 现在多线程并行调 find_references，
+        # 三个缓存会被并发读写，用一把锁保护（临界区都是极短的 dict 操作）。
+        # find_references 主体（trace_path 子进程调用）不加锁，保持并行。
+        self._cache_lock = threading.Lock()
 
     # ── CLI 调用基础设施 ──────────────────────────────────────────
 
@@ -328,7 +333,8 @@ class CodebaseMemoryBackend(CodeIntelligenceBackend):
             return
         name = response.get("project")
         if isinstance(name, str) and name:
-            self._project_name_cache[repo_str] = name
+            with self._cache_lock:
+                self._project_name_cache[repo_str] = name
 
     def _project(self, repo_path: Path) -> str:
         """返回 repo_path 对应的 CBM 派生项目名。
@@ -338,7 +344,8 @@ class CodebaseMemoryBackend(CodeIntelligenceBackend):
         能解析路径，至少不会比现在更差。
         """
         repo_str = str(repo_path)
-        cached = self._project_name_cache.get(repo_str)
+        with self._cache_lock:
+            cached = self._project_name_cache.get(repo_str)
         if cached:
             return cached
         try:
@@ -346,7 +353,8 @@ class CodebaseMemoryBackend(CodeIntelligenceBackend):
             self._capture_project_name(repo_str, status)
         except RuntimeError:
             pass
-        return self._project_name_cache.get(repo_str, repo_str)
+        with self._cache_lock:
+            return self._project_name_cache.get(repo_str, repo_str)
 
     def get_file_structure(
         self, repo_path: Path, file_path: str
@@ -432,7 +440,8 @@ class CodebaseMemoryBackend(CodeIntelligenceBackend):
         repo_str = str(repo_path)
 
         # 尝试从缓存获取 qualified_name
-        qn = self._qn_cache.get((file_path, obj_name, start_line))
+        with self._cache_lock:
+            qn = self._qn_cache.get((file_path, obj_name, start_line))
 
         if qn is None:
             # 回退:用短名搜索，取第一个匹配
@@ -603,8 +612,9 @@ class CodebaseMemoryBackend(CodeIntelligenceBackend):
 
         # 缓存 qualified_name → node info
         if qualified_name and start_line > 0:
-            self._qn_cache[(file_path, name, start_line)] = qualified_name
-            self._node_info_cache[qualified_name] = (file_path, start_line, end_line)
+            with self._cache_lock:
+                self._qn_cache[(file_path, name, start_line)] = qualified_name
+                self._node_info_cache[qualified_name] = (file_path, start_line, end_line)
 
         # have_return: 检查源码中是否含 return 语句（与 FileHandler 逻辑一致）
         if code_content:
@@ -638,8 +648,9 @@ class CodebaseMemoryBackend(CodeIntelligenceBackend):
         用于 ``find_references`` 中补全 trace_path 返回的 caller 信息。
         """
         # 先查缓存
-        if qualified_name in self._node_info_cache:
-            return self._node_info_cache[qualified_name]
+        with self._cache_lock:
+            if qualified_name in self._node_info_cache:
+                return self._node_info_cache[qualified_name]
 
         # 通过 get_code_snippet 获取信息
         try:
@@ -663,12 +674,10 @@ class CodebaseMemoryBackend(CodeIntelligenceBackend):
                 end_line = snippet.get("end_line", start_line)
 
                 if file_path and start_line > 0:
-                    self._node_info_cache[qualified_name] = (
-                        file_path,
-                        start_line,
-                        end_line,
-                    )
-                    return self._node_info_cache[qualified_name]
+                    info = (file_path, start_line, end_line)
+                    with self._cache_lock:
+                        self._node_info_cache[qualified_name] = info
+                    return info
         except RuntimeError:
             pass
 
@@ -712,7 +721,8 @@ class CodebaseMemoryBackend(CodeIntelligenceBackend):
             ):
                 qn = node.get("qualified_name", "")
                 if qn:
-                    self._qn_cache[(file_path, obj_name, start_line)] = qn
+                    with self._cache_lock:
+                        self._qn_cache[(file_path, obj_name, start_line)] = qn
                     return qn
 
         # 回退:取第一个 name 匹配的节点
@@ -720,7 +730,8 @@ class CodebaseMemoryBackend(CodeIntelligenceBackend):
             if node.get("name") == obj_name:
                 qn = node.get("qualified_name", "")
                 if qn:
-                    self._qn_cache[(file_path, obj_name, start_line)] = qn
+                    with self._cache_lock:
+                        self._qn_cache[(file_path, obj_name, start_line)] = qn
                     return qn
 
         return None

@@ -481,7 +481,18 @@ class MetaInfo:
         return now_node
 
     def parse_reference(self):
-        """双向提取所有引用关系"""
+        """双向提取所有引用关系
+
+        分两阶段执行，以并行化耗时的 CBM 查询：
+
+        - 阶段 A（并行）：对每个对象调一次 ``find_references``（每次 fork 一个
+          CBM 子进程跑 ``trace_path``，~40ms，是 N 个对象的总瓶颈）。各对象查询
+          相互独立，用线程池并行。线程数取自 ``max_thread_count``（``-mtc``）。
+        - 阶段 B（串行）：处理查询结果，写 ``reference_who`` / ``who_reference_me``
+          （跨对象共享写）。串行执行避免锁竞争；写入本身很快，瓶颈在查询。
+
+        缓存（``_qn_cache`` 等）的并发安全由后端的 ``_cache_lock`` 保证。
+        """
         file_nodes = self.get_all_files()
 
         white_list_file_names, white_list_obj_names = (
@@ -492,33 +503,42 @@ class MetaInfo:
             white_list_file_names = [cont["file_path"] for cont in self.white_list]
             white_list_obj_names = [cont["id_text"] for cont in self.white_list]
 
-        for file_node in tqdm(file_nodes, desc="parsing bidirectional reference"):
-            """检测一个文件内的所有引用信息，只能检测引用该文件内某个obj的其他内容。
-            1. 如果某个文件是jump-files，就不应该出现在这个循环里
-            2. 如果检测到的引用信息来源于一个jump-files, 忽略它
-            3. 如果检测到一个引用来源于fake-file,则认为他的母文件是原来的文件
-            """
+        # ── 阶段 A：收集任务 + 并行查询 ──────────────────────────
+        # tasks: [(now_obj, rel_file_path, in_file_only), ...]
+        tasks: List[tuple] = []
+        for file_node in file_nodes:
             assert not file_node.get_full_name().endswith(latest_verison_substring)
-
-            ref_count = 0
             rel_file_path = file_node.get_full_name()
             assert rel_file_path not in self.jump_files
-
             if white_list_file_names != [] and (
                 file_node.get_file_name() not in white_list_file_names
             ):  # 如果有白名单，只parse白名单里的对象
                 continue
 
-            def walk_file(now_obj: DocItem):
-                """在文件内遍历所有变量"""
-                nonlocal ref_count, white_list_file_names
+            def collect(now_obj: DocItem):
                 in_file_only = False
                 if white_list_obj_names != [] and (
                     now_obj.obj_name not in white_list_obj_names
                 ):
                     in_file_only = True  # 作为加速，如果有白名单，白名单obj同文件夹下的也parse，但是只找同文件内的引用
+                tasks.append((now_obj, rel_file_path, in_file_only))
+                for _, child in now_obj.children.items():
+                    collect(child)
 
-                reference_list = get_backend().find_references(
+            for _, child in file_node.children.items():
+                collect(child)
+
+        backend = get_backend()
+        max_workers = 1
+        try:
+            max_workers = SettingsManager.get_setting().project.max_thread_count
+        except Exception:
+            max_workers = 1
+
+        def query_one(task):
+            now_obj, rel_file_path, in_file_only = task
+            try:
+                return get_backend().find_references(
                     repo_path=self.repo_path,
                     file_path=rel_file_path,
                     obj_name=now_obj.obj_name,
@@ -526,75 +546,79 @@ class MetaInfo:
                     name_column=now_obj.content["name_column"],
                     in_file_only=in_file_only,
                 )
-                for referencer_pos in reference_list:  # 对于每个引用
-                    referencer_file_ral_path = referencer_pos[0]
-                    if referencer_file_ral_path in self.fake_file_reflection.values():
-                        """检测到的引用者来自于unstaged files，跳过该引用"""
-                        print(
-                            f"{Fore.LIGHTBLUE_EX}[Reference From Unstaged Version, skip]{Style.RESET_ALL} {referencer_file_ral_path} -> {now_obj.get_full_name()}"
-                        )
-                        continue
-                    elif referencer_file_ral_path in self.jump_files:
-                        """检测到的引用者来自于untracked files，跳过该引用"""
-                        print(
-                            f"{Fore.LIGHTBLUE_EX}[Reference From Unstracked Version, skip]{Style.RESET_ALL} {referencer_file_ral_path} -> {now_obj.get_full_name()}"
-                        )
-                        continue
+            except Exception as e:
+                logger.warning(
+                    f"find_references failed for {now_obj.get_full_name()}: {e}"
+                )
+                return []
 
-                    target_file_hiera = referencer_file_ral_path.split("/")
-                    # for file_hiera_id in range(len(target_file_hiera)):
-                    #     if target_file_hiera[file_hiera_id].endswith(fake_file_substring):
-                    #         prefix = "/".join(target_file_hiera[:file_hiera_id+1])
-                    #         find_in_reflection = False
-                    #         for real, fake in self.fake_file_reflection.items():
-                    #             if fake == prefix:
-                    #                 print(f"{Fore.BLUE}Find Reference in Fake-File: {Style.RESET_ALL}{referencer_file_ral_path} {Fore.BLUE}referred{Style.RESET_ALL} {now_obj.item_type.name} {now_obj.get_full_name()}")
-                    #                 target_file_hiera = real.split("/") + target_file_hiera[file_hiera_id+1:]
-                    #                 find_in_reflection = True
-                    #                 break
-                    #         assert find_in_reflection
-                    #         break
+        results: List[List] = []
+        if tasks:
+            import concurrent.futures
 
-                    referencer_file_item = self.target_repo_hierarchical_tree.find(
-                        target_file_hiera
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=max(1, int(max_workers))
+            ) as executor:
+                for ref_list in tqdm(
+                    executor.map(query_one, tasks),
+                    total=len(tasks),
+                    desc="parsing bidirectional reference",
+                ):
+                    results.append(ref_list)
+
+        # ── 阶段 B：串行处理结果，写引用关系 ──────────────────────
+        for (now_obj, rel_file_path, _in_file_only), reference_list in zip(
+            tasks, results
+        ):
+            for referencer_pos in reference_list:  # 对于每个引用
+                referencer_file_ral_path = referencer_pos[0]
+                if referencer_file_ral_path in self.fake_file_reflection.values():
+                    """检测到的引用者来自于unstaged files，跳过该引用"""
+                    print(
+                        f"{Fore.LIGHTBLUE_EX}[Reference From Unstaged Version, skip]{Style.RESET_ALL} {referencer_file_ral_path} -> {now_obj.get_full_name()}"
                     )
-                    if referencer_file_item == None:
-                        print(
-                            f'{Fore.LIGHTRED_EX}Error: Find "{referencer_file_ral_path}"(not in target repo){Style.RESET_ALL} referenced {now_obj.get_full_name()}'
-                        )
-                        continue
-                    referencer_node = self.find_obj_with_lineno(
-                        referencer_file_item, referencer_pos[1]
+                    continue
+                elif referencer_file_ral_path in self.jump_files:
+                    """检测到的引用者来自于untracked files，跳过该引用"""
+                    print(
+                        f"{Fore.LIGHTBLUE_EX}[Reference From Unstracked Version, skip]{Style.RESET_ALL} {referencer_file_ral_path} -> {now_obj.get_full_name()}"
                     )
-                    if referencer_node.obj_name == now_obj.obj_name:
-                        logger.info(
-                            f"Jedi find {now_obj.get_full_name()} with name_duplicate_reference, skipped"
-                        )
-                        continue
-                    # if now_obj.get_full_name() == "repo_agent/runner.py/Runner/run":
-                    #     import pdb; pdb.set_trace()
-                    if DocItem.has_ans_relation(now_obj, referencer_node) == None:
-                        # 不考虑祖先节点之间的引用
-                        if now_obj not in referencer_node.reference_who:
-                            special_reference_type = (
-                                referencer_node.item_type
-                                in [
-                                    DocItemType._function,
-                                    DocItemType._sub_function,
-                                    DocItemType._class_function,
-                                ]
-                            ) and referencer_node.code_start_line == referencer_pos[1]
-                            referencer_node.special_reference_type.append(
-                                special_reference_type
-                            )
-                            referencer_node.reference_who.append(now_obj)
-                            now_obj.who_reference_me.append(referencer_node)
-                            ref_count += 1
-                for _, child in now_obj.children.items():
-                    walk_file(child)
+                    continue
 
-            for _, child in file_node.children.items():
-                walk_file(child)
+                target_file_hiera = referencer_file_ral_path.split("/")
+
+                referencer_file_item = self.target_repo_hierarchical_tree.find(
+                    target_file_hiera
+                )
+                if referencer_file_item == None:
+                    print(
+                        f'{Fore.LIGHTRED_EX}Error: Find "{referencer_file_ral_path}"(not in target repo){Style.RESET_ALL} referenced {now_obj.get_full_name()}'
+                    )
+                    continue
+                referencer_node = self.find_obj_with_lineno(
+                    referencer_file_item, referencer_pos[1]
+                )
+                if referencer_node.obj_name == now_obj.obj_name:
+                    logger.info(
+                        f"Jedi find {now_obj.get_full_name()} with name_duplicate_reference, skipped"
+                    )
+                    continue
+                if DocItem.has_ans_relation(now_obj, referencer_node) == None:
+                    # 不考虑祖先节点之间的引用
+                    if now_obj not in referencer_node.reference_who:
+                        special_reference_type = (
+                            referencer_node.item_type
+                            in [
+                                DocItemType._function,
+                                DocItemType._sub_function,
+                                DocItemType._class_function,
+                            ]
+                        ) and referencer_node.code_start_line == referencer_pos[1]
+                        referencer_node.special_reference_type.append(
+                            special_reference_type
+                        )
+                        referencer_node.reference_who.append(now_obj)
+                        now_obj.who_reference_me.append(referencer_node)
             # logger.info(f"find {ref_count} refer-relation in {file_node.get_full_name()}")
 
     def get_task_manager(self, now_node: DocItem, task_available_func) -> TaskManager:
