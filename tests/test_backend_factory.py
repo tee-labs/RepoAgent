@@ -459,5 +459,112 @@ class TestCliRawJsonArgs(unittest.TestCase):
         self.assertIn("repo_path", msg)  # payload 里有 repo_path
 
 
+class TestProjectNameResolution(unittest.TestCase):
+    """测试 CBM 派生项目名的解析与使用。
+
+    CBM 的 index_repository 接受 repo_path（原始路径），但 search_graph /
+    get_code_snippet / trace_path 的 project 字段在某些版本（如 0.8.1）只认
+    CBM 派生名（``D:\\a\\b`` → ``D-a-b``），不做路径→名解析。派生名必须从
+    index 响应里读出，不能本地复刻。
+
+    本测试 mock ``_run_cli``，验证：index 时抓取并缓存派生名；后续查询用缓存
+    名而非原始路径；未命中时回退到 index_status 查询。
+    """
+
+    def test_index_repo_captures_derived_project_name(self):
+        """index_repo 应从 index_repository 响应里抓取派生名并缓存。"""
+        from repo_agent.code_intelligence.cbm_backend import CodebaseMemoryBackend
+
+        backend = CodebaseMemoryBackend(binary_path="codebase-memory-mcp")
+
+        def fake_run_cli(tool, args):
+            if tool == "index_status":
+                return {"error": "not found"}  # 触发实际索引
+            if tool == "index_repository":
+                # CBM 返回派生名 D-a-b（对应路径 D:\a\b）
+                return {"project": "D-a-b", "nodes": 5, "edges": 6, "status": "indexed"}
+            return {}
+
+        with patch.object(backend, "_run_cli", side_effect=fake_run_cli):
+            backend.index_repo(Path(r"D:\a\b"), mode="full")
+
+        self.assertEqual(
+            backend._project_name_cache[r"D:\a\b"], "D-a-b"
+        )
+
+    def test_project_returns_cached_name(self):
+        """_project() 优先返回缓存，不再调用 CBM。"""
+        from repo_agent.code_intelligence.cbm_backend import CodebaseMemoryBackend
+
+        backend = CodebaseMemoryBackend(binary_path="codebase-memory-mcp")
+        backend._project_name_cache["/tmp/repo"] = "tmp-repo"
+
+        with patch.object(backend, "_run_cli") as mock_cli:
+            name = backend._project(Path("/tmp/repo"))
+            mock_cli.assert_not_called()  # 命中缓存，不该调 CBM
+
+        self.assertEqual(name, "tmp-repo")
+
+    def test_project_falls_back_to_index_status_lookup(self):
+        """缓存未命中时，_project() 调 index_status 获取派生名。"""
+        from repo_agent.code_intelligence.cbm_backend import CodebaseMemoryBackend
+
+        backend = CodebaseMemoryBackend(binary_path="codebase-memory-mcp")
+
+        def fake_run_cli(tool, args):
+            if tool == "index_status":
+                return {"project": "derived-name", "nodes": 3}
+            return {}
+
+        with patch.object(backend, "_run_cli", side_effect=fake_run_cli):
+            name = backend._project(Path("/tmp/repo"))
+
+        self.assertEqual(name, "derived-name")
+        self.assertEqual(backend._project_name_cache["/tmp/repo"], "derived-name")
+
+    def test_query_methods_use_derived_name_not_raw_path(self):
+        """get_overall_structure 等查询应用派生名作为 project，而非原始路径。"""
+        from repo_agent.code_intelligence.cbm_backend import CodebaseMemoryBackend
+
+        backend = CodebaseMemoryBackend(binary_path="codebase-memory-mcp")
+        # 模拟已索引：缓存里已有派生名
+        backend._project_name_cache[r"D:\source\repo"] = "D-source-repo"
+        backend._indexed_repo = r"D:\source\repo"
+
+        captured_projects = []
+
+        def fake_run_cli(tool, args):
+            captured_projects.append((tool, args.get("project")))
+            if tool == "search_graph":
+                return {"results": []}
+            return {"results": []}
+
+        with patch.object(backend, "_run_cli", side_effect=fake_run_cli):
+            backend.get_overall_structure(Path(r"D:\source\repo"), {}, [])
+
+        # 所有 search_graph 调用都应用派生名，而不是原始路径
+        for tool, project in captured_projects:
+            if tool == "search_graph":
+                self.assertEqual(
+                    project,
+                    "D-source-repo",
+                    f"search_graph 应使用派生名，实际用了 {project!r}",
+                )
+
+    def test_project_fallback_to_raw_path_on_failure(self):
+        """index_status 失败时，_project() 退回原始路径（CBM 0.9.0 能解析）。"""
+        from repo_agent.code_intelligence.cbm_backend import CodebaseMemoryBackend
+
+        backend = CodebaseMemoryBackend(binary_path="codebase-memory-mcp")
+
+        def fake_run_cli(tool, args):
+            raise RuntimeError("boom")
+
+        with patch.object(backend, "_run_cli", side_effect=fake_run_cli):
+            name = backend._project(Path("/tmp/repo"))
+
+        self.assertEqual(name, "/tmp/repo")  # 退回原始路径
+
+
 if __name__ == "__main__":
     unittest.main()

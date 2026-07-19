@@ -114,6 +114,13 @@ class CodebaseMemoryBackend(CodeIntelligenceBackend):
         self._node_info_cache: Dict[str, Tuple[str, int, int]] = {}
         # 标记是否已对当前仓库建过索引
         self._indexed_repo: Optional[str] = None
+        # CBM 派生的项目名缓存：repo_str → derived project name。
+        # index_repository 接受 repo_path（原始路径），但 search_graph /
+        # index_status / get_code_snippet / trace_path 的 project 字段在某些
+        # CBM 版本（如 0.8.1）只认派生名（如 "D:\a\b" → "D-a-b"），不做
+        # 路径→名解析。派生规则与路径格式相关（\ : / 处理不同），不能本地复刻，
+        # 故从 index 响应里读出并缓存。
+        self._project_name_cache: Dict[str, str] = {}
 
     # ── CLI 调用基础设施 ──────────────────────────────────────────
 
@@ -166,6 +173,11 @@ class CodebaseMemoryBackend(CodeIntelligenceBackend):
                 cmd,
                 capture_output=True,
                 text=True,
+                # CBM 始终输出 UTF-8。Windows 上 text=True 默认用 locale 编码
+                # （中文 Windows 是 GBK）解码，遇到非 ASCII 字节会抛
+                # UnicodeDecodeError 并损坏输出。强制 UTF-8 + 替换非法字节。
+                encoding="utf-8",
+                errors="replace",
                 timeout=600,
             )
         except FileNotFoundError:
@@ -247,6 +259,8 @@ class CodebaseMemoryBackend(CodeIntelligenceBackend):
             if isinstance(status, dict) and not status.get("error"):
                 node_count = status.get("nodes", 0)
                 if node_count > 0:
+                    # index_status 响应里也带派生名，趁机缓存。
+                    self._capture_project_name(repo_str, status)
                     logger.info(
                         f"CBM index already exists for {repo_str} "
                         f"({node_count} nodes, {status.get('edges', 0)} edges)."
@@ -271,10 +285,38 @@ class CodebaseMemoryBackend(CodeIntelligenceBackend):
         if isinstance(result, dict):
             node_count = result.get("nodes", 0)
             edge_count = result.get("edges", 0)
+            # index_repository 响应里的 "project" 是 CBM 派生的项目名。
+            self._capture_project_name(repo_str, result)
         logger.info(
             f"CBM: indexing complete ({node_count} nodes, {edge_count} edges)."
         )
         self._indexed_repo = repo_str
+
+    def _capture_project_name(self, repo_str: str, response: Any) -> None:
+        """从 index / index_status 响应里提取并缓存 CBM 派生的项目名。"""
+        if not isinstance(response, dict):
+            return
+        name = response.get("project")
+        if isinstance(name, str) and name:
+            self._project_name_cache[repo_str] = name
+
+    def _project(self, repo_path: Path) -> str:
+        """返回 repo_path 对应的 CBM 派生项目名。
+
+        优先用缓存（index 时已抓取）；未命中则调一次 index_status 获取并缓存。
+        若都拿不到（如 CBM 未响应 project 字段），退回原始路径——CBM 0.9.0
+        能解析路径，至少不会比现在更差。
+        """
+        repo_str = str(repo_path)
+        cached = self._project_name_cache.get(repo_str)
+        if cached:
+            return cached
+        try:
+            status = self._run_cli("index_status", {"project": repo_str})
+            self._capture_project_name(repo_str, status)
+        except RuntimeError:
+            pass
+        return self._project_name_cache.get(repo_str, repo_str)
 
     def get_file_structure(
         self, repo_path: Path, file_path: str
@@ -373,7 +415,7 @@ class CodebaseMemoryBackend(CodeIntelligenceBackend):
             "trace_path",
             {
                 "function_name": qn,
-                "project": repo_str,
+                "project": self._project(repo_path),
                 "direction": "inbound",
                 "mode": "calls",
                 "format": "json",
@@ -429,7 +471,7 @@ class CodebaseMemoryBackend(CodeIntelligenceBackend):
         """
         repo_str = str(repo_path)
         args: dict = {
-            "project": repo_str,
+            "project": self._project(repo_path),
             "format": "json",
             "limit": 10000,
         }
@@ -507,7 +549,7 @@ class CodebaseMemoryBackend(CodeIntelligenceBackend):
                     "get_code_snippet",
                     {
                         "qualified_name": qualified_name,
-                        "project": str(repo_path),
+                        "project": self._project(repo_path),
                     },
                 )
                 if isinstance(snippet, dict) and not snippet.get("error"):
@@ -571,7 +613,7 @@ class CodebaseMemoryBackend(CodeIntelligenceBackend):
                 "get_code_snippet",
                 {
                     "qualified_name": qualified_name,
-                    "project": str(repo_path),
+                    "project": self._project(repo_path),
                 },
             )
             if isinstance(snippet, dict) and not snippet.get("error"):
@@ -612,7 +654,7 @@ class CodebaseMemoryBackend(CodeIntelligenceBackend):
             result = self._run_cli(
                 "search_graph",
                 {
-                    "project": repo_str,
+                    "project": self._project(repo_path),
                     "name_pattern": obj_name,
                     "file_pattern": file_path,
                     "format": "json",
