@@ -78,6 +78,15 @@ def handle_setting_error(e: ValidationError):
     type=str,
 )
 @click.option(
+    "--use-stream",
+    "-us",
+    is_flag=True,
+    show_default=True,
+    default=False,
+    help="Call the LLM in stream mode. Set this if your OpenAI-compatible API "
+    "only supports streaming (non-stream calls fail).",
+)
+@click.option(
     "--target-repo-path",
     "-tp",
     default="",
@@ -162,6 +171,7 @@ def run(
     temperature,
     request_timeout,
     base_url,
+    use_stream,
     target_repo_path,
     hierarchy_path,
     markdown_docs_path,
@@ -187,6 +197,7 @@ def run(
             temperature=temperature,
             request_timeout=request_timeout,
             openai_base_url=base_url,
+            use_stream=use_stream,
             max_thread_count=max_thread_count,
             reference_parse_concurrency=reference_parse_concurrency,
             file_extensions=[

@@ -23,6 +23,8 @@ class ChatEngine:
             max_retries=1,
             is_chat_model=True,
         )
+        # 某些 OpenAI 兼容 API 只支持 stream。为 True 时用 stream_chat 聚合结果。
+        self.use_stream = setting.chat_completion.use_stream
 
     def build_prompt(self, doc_item: DocItem):
         """Builds and returns the system and user prompts based on the DocItem."""
@@ -118,15 +120,62 @@ class ChatEngine:
         messages = self.build_prompt(doc_item)
 
         try:
+            if self.use_stream:
+                return self._generate_doc_stream(messages)
             response = self.llm.chat(messages)
-            logger.debug(f"LLM Prompt Tokens: {response.raw.usage.prompt_tokens}")  # type: ignore
-            logger.debug(
-                f"LLM Completion Tokens: {response.raw.usage.completion_tokens}"  # type: ignore
-            )
-            logger.debug(
-                f"Total LLM Token Count: {response.raw.usage.total_tokens}"  # type: ignore
-            )
+            self._log_token_usage(response)
             return response.message.content
         except Exception as e:
             logger.error(f"Error in llamaindex chat call: {e}")
             raise
+
+    def _generate_doc_stream(self, messages):
+        """stream 模式：聚合 stream_chat 的 chunks 取最终全文。
+
+        每个 chunk 的 ``message.content`` 已是累积全文（llama_index OpenAI
+        stream 实现内部累加），故取最后一个即可。usage 在 stream 下不保证
+        可用——需服务端在末尾发 usage chunk 且请求带
+        ``stream_options={"include_usage": True}``；取不到就跳过 token 日志。
+        """
+        last_response = None
+        for chunk in self.llm.stream_chat(
+            messages, stream_options={"include_usage": True}
+        ):
+            last_response = chunk
+        final_text = (
+            last_response.message.content if last_response is not None else ""
+        )
+        if last_response is not None:
+            self._log_token_usage(last_response)
+        return final_text
+
+    @staticmethod
+    def _log_token_usage(response):
+        """记录 token 用量，容错：stream 下可能拿不到 usage。
+
+        非 stream：response.raw.usage 有 prompt/completion/total_tokens。
+        stream：usage 在最后一个 chunk 的 additional_kwargs（llama_index 解析后），
+        或 raw.usage（取决于服务端）。任一拿不到都静默跳过该日志。
+        """
+        usage = getattr(response, "raw", None)
+        usage = getattr(usage, "usage", None) if usage is not None else None
+        if usage is None:
+            # 回退到 additional_kwargs（stream 路径 llama_index 解析后存放处）
+            ak = getattr(response, "additional_kwargs", {}) or {}
+            if not ak:
+                return
+            prompt = ak.get("prompt_tokens")
+            completion = ak.get("completion_tokens")
+            total = ak.get("total_tokens")
+            if prompt is None and completion is None:
+                return
+            logger.debug(f"LLM Prompt Tokens: {prompt}")
+            logger.debug(f"LLM Completion Tokens: {completion}")
+            logger.debug(f"Total LLM Token Count: {total}")
+            return
+        try:
+            logger.debug(f"LLM Prompt Tokens: {usage.prompt_tokens}")
+            logger.debug(f"LLM Completion Tokens: {usage.completion_tokens}")
+            logger.debug(f"Total LLM Token Count: {usage.total_tokens}")
+        except AttributeError:
+            pass

@@ -75,6 +75,10 @@ class ChatCompletionSettings(BaseSettings):
     request_timeout: PositiveInt = 60
     openai_base_url: str = "https://api.openai.com/v1"
     openai_api_key: SecretStr = Field(..., exclude=True)
+    # 是否用 stream 模式调 LLM。某些 OpenAI 兼容 API 只支持 stream
+    # （非 stream 调用会失败）。默认 False（行为不变）；遇到只支持 stream
+    # 的 API 时设为 True。
+    use_stream: bool = False
 
     @field_validator("openai_base_url", mode="before")
     @classmethod
@@ -116,6 +120,7 @@ class SettingsManager:
         cbm_index_mode: str = "full",
         file_extensions: list[str] = None,
         reference_parse_concurrency: Optional[int] = None,
+        use_stream: bool = False,
     ):
         if file_extensions is None:
             file_extensions = ["py"]
@@ -138,6 +143,7 @@ class SettingsManager:
             temperature=temperature,
             request_timeout=request_timeout,
             openai_base_url=openai_base_url,
+            use_stream=use_stream,
         )
 
         cls._setting_instance = Setting(
