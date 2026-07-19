@@ -54,6 +54,36 @@ def _is_project_file(file_path: str) -> bool:
     return not file_path.startswith(_NON_PROJECT_FILE_MARKERS)
 
 
+def _normalize_file_path(repo_path: Path, file_path: str) -> str:
+    """把 CBM 返回的 file_path 归一化为「相对仓库根 + 正斜杠」形式。
+
+    背景：CBM 各工具返回的 file_path 格式不一致且与平台相关——
+
+    - ``search_graph`` 在 Linux 返回相对路径（``G.java``），在 Windows 返回
+      绝对正斜杠路径（``D:/source/.../G.java``）；
+    - ``get_code_snippet`` 始终返回绝对路径（Linux ``/tmp/...``，Windows
+      ``D:/source/...``），分隔符是正斜杠。
+
+    下游 ``doc_meta_info`` 的契约是**相对路径 + 正斜杠**：它用
+    ``file_name.split("/")`` 构建树、用 ``os.path.join(target_repo, file_name)``
+    定位文件。因此本函数把任意 CBM 路径统一成相对正斜杠形式：
+
+    1. 反斜杠 → 正斜杠（统一分隔符，Windows 路径 ``D:\\a\\b`` → ``D:/a/b``）；
+    2. 若以仓库根开头（大小写不敏感比较，因为 Windows 盘符大小写不定），
+       去掉前缀；
+    3. 去掉前导斜杠。
+
+    已经是相对路径的输入为 no-op（保证 Linux 现有行为不变）。
+    """
+    if not file_path:
+        return file_path
+    norm = file_path.replace("\\", "/")
+    repo_norm = str(repo_path).replace("\\", "/")
+    if repo_norm and norm.lower().startswith(repo_norm.lower()):
+        norm = norm[len(repo_norm):]
+    return norm.lstrip("/")
+
+
 def _configured_file_extensions() -> Optional[List[str]]:
     """从 settings 读取已配置的源文件扩展名列表。
 
@@ -368,6 +398,9 @@ class CodebaseMemoryBackend(CodeIntelligenceBackend):
             if not raw_file_path:
                 continue
 
+            # 归一化为相对正斜杠路径（Windows 上 CBM 可能返回绝对路径）。
+            raw_file_path = _normalize_file_path(repo_path, raw_file_path)
+
             # 跳过 jump_files（未跟踪文件）
             if raw_file_path in jump_files:
                 continue
@@ -529,7 +562,8 @@ class CodebaseMemoryBackend(CodeIntelligenceBackend):
         label = node.get("label", "")
         code_type = _LABEL_TO_TYPE.get(label, "FunctionDef")
 
-        file_path = node.get("file_path", "")
+        # 归一化为相对正斜杠路径，保证与 find_references 返回的路径、树键一致。
+        file_path = _normalize_file_path(repo_path, node.get("file_path", ""))
         qualified_name = node.get("qualified_name", "")
 
         # search_graph 不返回 start_line/end_line，需要从 get_code_snippet 获取
@@ -617,11 +651,13 @@ class CodebaseMemoryBackend(CodeIntelligenceBackend):
                 },
             )
             if isinstance(snippet, dict) and not snippet.get("error"):
-                # file_path 在 snippet 中是绝对路径，需要转成相对路径
-                file_path = snippet.get("file_path", "")
-                repo_str = str(repo_path)
-                if file_path.startswith(repo_str):
-                    file_path = file_path[len(repo_str):].lstrip("/")
+                # get_code_snippet 的 file_path 是绝对路径（Linux /tmp/...、
+                # Windows D:/source/...），归一化为相对正斜杠路径。原手写转换
+                # 在 Windows 上因反斜杠/正斜杠不一致而失效，导致引用解析拿到
+                # 绝对路径、报 "not in target repo"。
+                file_path = _normalize_file_path(
+                    repo_path, snippet.get("file_path", "")
+                )
 
                 start_line = snippet.get("start_line", 0)
                 end_line = snippet.get("end_line", start_line)
@@ -668,9 +704,11 @@ class CodebaseMemoryBackend(CodeIntelligenceBackend):
             return None
 
         for node in result.get("results", []):
+            # 比较前把 node 的 file_path 归一化（Windows 上 CBM 返回绝对路径）。
             if (
                 node.get("name") == obj_name
-                and node.get("file_path") == file_path
+                and _normalize_file_path(repo_path, node.get("file_path", ""))
+                == file_path
             ):
                 qn = node.get("qualified_name", "")
                 if qn:

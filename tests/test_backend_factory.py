@@ -566,5 +566,127 @@ class TestProjectNameResolution(unittest.TestCase):
         self.assertEqual(name, "/tmp/repo")  # 退回原始路径
 
 
+class TestFilePathNormalization(unittest.TestCase):
+    """测试 CBM 返回路径的归一化（修复 Windows 上引用解析 "not in target repo"）。
+
+    CBM 在不同平台/工具返回的 file_path 格式不一致：search_graph 在 Linux
+    返回相对路径，在 Windows 返回绝对正斜杠路径；get_code_snippet 始终返回
+    绝对路径。下游 doc_meta_info 的契约是「相对路径 + 正斜杠」。本测试验证
+    _normalize_file_path 及其在 get_overall_structure / _lookup_node_info 的应用，
+    用 Windows 风格输入（反斜杠 repo 路径 + 正斜杠绝对文件路径）模拟现场。
+    """
+
+    def test_normalize_unit_forward_slash_absolute(self):
+        """正斜杠绝对路径 → 相对路径（Windows CBM 的典型输出）。"""
+        from repo_agent.code_intelligence.cbm_backend import _normalize_file_path
+
+        repo = Path(r"D:\source\NGCRM\crm\jbusiness")
+        # CBM 返回正斜杠绝对路径
+        result = _normalize_file_path(
+            repo, r"D:/source/NGCRM/crm/jbusiness/opcode/src/main/java/X.java"
+        )
+        self.assertEqual(result, "opcode/src/main/java/X.java")
+
+    def test_normalize_unit_backslash_absolute(self):
+        """反斜杠绝对路径 → 相对正斜杠路径。"""
+        from repo_agent.code_intelligence.cbm_backend import _normalize_file_path
+
+        repo = Path(r"D:\source\repo")
+        result = _normalize_file_path(repo, r"D:\source\repo\src\G.java")
+        self.assertEqual(result, "src/G.java")
+
+    def test_normalize_unit_case_insensitive_drive_letter(self):
+        """盘符大小写不一致（D: vs d:）也应能去掉前缀。"""
+        from repo_agent.code_intelligence.cbm_backend import _normalize_file_path
+
+        repo = Path(r"D:\source\repo")
+        result = _normalize_file_path(repo, r"d:/source/repo/X.java")
+        self.assertEqual(result, "X.java")
+
+    def test_normalize_unit_already_relative_is_noop(self):
+        """已经是相对路径的输入应原样返回（保证 Linux 行为不变）。"""
+        from repo_agent.code_intelligence.cbm_backend import _normalize_file_path
+
+        repo = Path("/tmp/repo")
+        self.assertEqual(_normalize_file_path(repo, "src/G.java"), "src/G.java")
+        self.assertEqual(_normalize_file_path(repo, "G.java"), "G.java")
+
+    def test_normalize_unit_empty(self):
+        """空输入原样返回。"""
+        from repo_agent.code_intelligence.cbm_backend import _normalize_file_path
+
+        self.assertEqual(_normalize_file_path(Path("/tmp/repo"), ""), "")
+
+    def test_get_overall_structure_normalizes_windows_paths(self):
+        """get_overall_structure 的键应是相对路径，即使 CBM 返回绝对路径。"""
+        from repo_agent.code_intelligence.cbm_backend import CodebaseMemoryBackend
+
+        backend = CodebaseMemoryBackend(binary_path="codebase-memory-mcp")
+        backend._indexed_repo = r"D:\source\repo"
+        backend._project_name_cache[r"D:\source\repo"] = "D-source-repo"
+
+        # 模拟 Windows：CBM search_graph 返回绝对正斜杠路径。
+        def fake_run_cli(tool, args):
+            if tool == "search_graph":
+                return {
+                    "results": [
+                        {
+                            "name": "greet",
+                            "label": "Method",
+                            "file_path": "D:/source/repo/src/G.java",
+                            "qualified_name": "D-source-repo.G.greet",
+                        }
+                    ]
+                }
+            if tool == "get_code_snippet":
+                return {
+                    "source": "public void greet(){}",
+                    "start_line": 1,
+                    "end_line": 1,
+                    "signature": "()",
+                    "file_path": "D:/source/repo/src/G.java",
+                }
+            return {}
+
+        with patch.object(backend, "_run_cli", side_effect=fake_run_cli):
+            with patch(
+                "repo_agent.code_intelligence.cbm_backend._configured_file_extensions",
+                return_value=["java"],
+            ):
+                structure = backend.get_overall_structure(
+                    Path(r"D:\source\repo"), {}, []
+                )
+
+        # 键必须是相对路径，不能含盘符/仓库根。
+        self.assertEqual(list(structure.keys()), ["src/G.java"])
+
+    def test_lookup_node_info_normalizes_absolute_snippet_path(self):
+        """_lookup_node_info 应把 get_code_snippet 的绝对路径归一化（这是 bug 所在）。"""
+        from repo_agent.code_intelligence.cbm_backend import CodebaseMemoryBackend
+
+        backend = CodebaseMemoryBackend(binary_path="codebase-memory-mcp")
+        backend._project_name_cache[r"D:\source\repo"] = "D-source-repo"
+
+        def fake_run_cli(tool, args):
+            # get_code_snippet 返回 Windows 风格绝对正斜杠路径。
+            if tool == "get_code_snippet":
+                return {
+                    "file_path": "D:/source/repo/opcode/X.java",
+                    "start_line": 5,
+                    "end_line": 10,
+                }
+            return {}
+
+        with patch.object(backend, "_run_cli", side_effect=fake_run_cli):
+            file_path, start, end = backend._lookup_node_info(
+                Path(r"D:\source\repo"), "X.foo"
+            )
+
+        # 必须是相对路径；修复前会返回绝对路径 D:/source/repo/opcode/X.java。
+        self.assertEqual(file_path, "opcode/X.java")
+        self.assertEqual(start, 5)
+        self.assertEqual(end, 10)
+
+
 if __name__ == "__main__":
     unittest.main()
