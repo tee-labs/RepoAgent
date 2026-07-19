@@ -30,6 +30,10 @@ class ProjectSettings(BaseSettings):
     ignore_list: list[str] = []
     language: str = "English"
     max_thread_count: PositiveInt = 4
+    # 引用解析（parse_reference，本地 CBM 子进程）的并发数。
+    # None 表示跟随 max_thread_count（向后兼容）。CBM 是本地子进程，
+    # 与 LLM API 限流无关，通常可以开得比 max_thread_count 更大。
+    reference_parse_concurrency: Optional[PositiveInt] = None
     log_level: LogLevel = LogLevel.INFO
     # codebase-memory-mcp 二进制路径
     cbm_binary_path: str = "codebase-memory-mcp"
@@ -111,6 +115,7 @@ class SettingsManager:
         cbm_binary_path: str = "codebase-memory-mcp",
         cbm_index_mode: str = "full",
         file_extensions: list[str] = None,
+        reference_parse_concurrency: Optional[int] = None,
     ):
         if file_extensions is None:
             file_extensions = ["py"]
@@ -121,6 +126,7 @@ class SettingsManager:
             ignore_list=ignore_list,
             language=language,
             max_thread_count=max_thread_count,
+            reference_parse_concurrency=reference_parse_concurrency,
             log_level=LogLevel(log_level),
             cbm_binary_path=cbm_binary_path,
             cbm_index_mode=cbm_index_mode,

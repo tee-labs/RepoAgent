@@ -65,12 +65,18 @@ def _build_two_file_tree():
 
 class TestParseReference(unittest.TestCase):
 
-    def _run_parse_reference(self, meta, refs_map, max_thread_count):
-        """用 fake backend 跑 parse_reference，patch 掉 get_backend 和设置。"""
+    def _run_parse_reference(self, meta, refs_map, max_thread_count,
+                             reference_parse_concurrency=None):
+        """用 fake backend 跑 parse_reference，patch 掉 get_backend 和设置。
+
+        reference_parse_concurrency=None 模拟"未设置 -rpc，跟随 -mtc"。
+        """
         fake = _FakeBackend(refs_map)
         with patch("repo_agent.doc_meta_info.get_backend", return_value=fake), \
              patch("repo_agent.doc_meta_info.SettingsManager") as sm:
-            sm.get_setting.return_value.project.max_thread_count = max_thread_count
+            proj = sm.get_setting.return_value.project
+            proj.max_thread_count = max_thread_count
+            proj.reference_parse_concurrency = reference_parse_concurrency
             meta.parse_reference()
         return fake
 
@@ -142,6 +148,31 @@ class TestParseReference(unittest.TestCase):
         refs_map = {(k, v): [] for k, v in [("a.py", "caller"), ("b.py", "callee")]}
         fake = self._run_parse_reference(meta, refs_map, max_thread_count=4)
         # caller 和 callee 各查一次
+        self.assertEqual(fake.call_count, 2)
+
+    def test_rpc_overrides_mtc_for_parse_concurrency(self):
+        """-rpc 设置时，引用解析并发用 -rpc 而非 -mtc（结果仍正确）。"""
+        meta, caller, callee = _build_two_file_tree()
+        refs_map = {
+            ("b.py", "callee"): [("a.py", 10, 0)],
+            ("a.py", "caller"): [],
+        }
+        # mtc=1（LLM 低并发），rpc=8（CBM 高并发）→ parse_reference 应用 8
+        self._run_parse_reference(
+            meta, refs_map, max_thread_count=1, reference_parse_concurrency=8
+        )
+        # 关系仍正确建立
+        self.assertIn(callee, caller.reference_who)
+        self.assertIn(caller, callee.who_reference_me)
+
+    def test_rpc_none_falls_back_to_mtc(self):
+        """-rpc 未设置（None）时，引用解析并发跟随 -mtc。"""
+        meta, caller, callee = _build_two_file_tree()
+        refs_map = {("a.py", "caller"): [], ("b.py", "callee"): []}
+        # rpc=None → 跟随 mtc=2，不应报错
+        fake = self._run_parse_reference(
+            meta, refs_map, max_thread_count=2, reference_parse_concurrency=None
+        )
         self.assertEqual(fake.call_count, 2)
 
 

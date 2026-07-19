@@ -120,6 +120,18 @@ def handle_setting_error(e: ValidationError):
     "-mtc",
     default=4,
     show_default=True,
+    help="Number of concurrent threads for LLM document generation. "
+    "Bounded by your LLM API rate limits.",
+)
+@click.option(
+    "--reference-parse-concurrency",
+    "-rpc",
+    default=None,
+    type=int,
+    help="Number of concurrent threads for CBM reference parsing "
+    "(parse_reference). Defaults to --max-thread-count when not set. "
+    "CBM runs local subprocesses (not API calls), so it can usually be "
+    "set higher than -mtc.",
 )
 @click.option(
     "--file-extensions",
@@ -156,6 +168,7 @@ def run(
     ignore_list,
     language,
     max_thread_count,
+    reference_parse_concurrency,
     log_level,
     print_hierarchy,
     file_extensions,
@@ -175,6 +188,7 @@ def run(
             request_timeout=request_timeout,
             openai_base_url=base_url,
             max_thread_count=max_thread_count,
+            reference_parse_concurrency=reference_parse_concurrency,
             file_extensions=[
                 ext.strip() for ext in file_extensions.split(",") if ext.strip()
             ],

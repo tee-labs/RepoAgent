@@ -487,7 +487,9 @@ class MetaInfo:
 
         - 阶段 A（并行）：对每个对象调一次 ``find_references``（每次 fork 一个
           CBM 子进程跑 ``trace_path``，~40ms，是 N 个对象的总瓶颈）。各对象查询
-          相互独立，用线程池并行。线程数取自 ``max_thread_count``（``-mtc``）。
+          相互独立，用线程池并行。线程数取自 ``reference_parse_concurrency``
+          （``-rpc``）；未设置时跟随 ``max_thread_count``（``-mtc``）。CBM 是
+          本地子进程，与 LLM API 限流无关，通常可设得比 -mtc 更大。
         - 阶段 B（串行）：处理查询结果，写 ``reference_who`` / ``who_reference_me``
           （跨对象共享写）。串行执行避免锁竞争；写入本身很快，瓶颈在查询。
 
@@ -528,10 +530,11 @@ class MetaInfo:
             for _, child in file_node.children.items():
                 collect(child)
 
-        backend = get_backend()
         max_workers = 1
         try:
-            max_workers = SettingsManager.get_setting().project.max_thread_count
+            proj = SettingsManager.get_setting().project
+            # 引用解析并发独立配置（-rpc）；未设置时跟随 max_thread_count（-mtc）。
+            max_workers = proj.reference_parse_concurrency or proj.max_thread_count
         except Exception:
             max_workers = 1
 
